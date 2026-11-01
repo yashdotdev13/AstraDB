@@ -1,4 +1,3 @@
-
 name: AstraDB CI
 
 on:
@@ -23,15 +22,13 @@ concurrency:
 
 jobs:
   build-and-test:
-    name: Build & Test (Java 21)
+    name: Build, Test & Code Quality (Java 21)
     runs-on: ubuntu-latest
 
     steps:
-      # Checkout source code
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      # Configure Java 21
       - name: Set up JDK 21
         uses: actions/setup-java@v5
         with:
@@ -39,29 +36,20 @@ jobs:
           java-version: "21"
           cache: maven
 
-      # Fix Linux execution permissions for Maven Wrapper
       - name: Make Maven Wrapper executable
         run: chmod +x mvnw
 
-      # Verify environment
       - name: Verify Java and Maven
         run: |
           java -version
           ./mvnw --version
 
-      # Compile all source code
-      - name: Compile project
-        run: ./mvnw -B clean compile
+      # Runs formatting, static analysis, tests,
+      # packaging, and coverage report generation.
+      - name: Build and verify all modules
+        run: ./mvnw -B clean verify
 
-      # Execute unit tests
-      - name: Run unit tests
-        run: ./mvnw -B test
-
-      # Build project artifacts
-      - name: Package project
-        run: ./mvnw -B package -DskipTests
-
-      # Upload test reports even if earlier steps fail
+      # Upload test reports even if the build fails.
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
@@ -70,3 +58,15 @@ jobs:
           path: "**/target/surefire-reports/*.xml"
           if-no-files-found: ignore
           retention-days: 7
+
+      # Upload JaCoCo coverage reports.
+      - name: Upload JaCoCo coverage reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-coverage-reports
+          path: |
+            target/site/jacoco-aggregate/**
+            **/target/site/jacoco/**
+          if-no-files-found: ignore
+          retention-days: 14
