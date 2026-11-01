@@ -1,0 +1,1 @@
+AstraDB — A distributed SQL database built in Java, featuring Raft consensus, sharded storage, replication, fault tolerance, and distributed query execution.
