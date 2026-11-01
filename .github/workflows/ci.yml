@@ -7,9 +7,11 @@ on:
       - main
       - "feature/**"
       - "fix/**"
+
   pull_request:
     branches:
       - main
+
   workflow_dispatch:
 
 permissions:
@@ -25,9 +27,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Checkout source code
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Configure Java 21
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -35,20 +39,29 @@ jobs:
           java-version: "21"
           cache: maven
 
+      # Fix Linux execution permissions for Maven Wrapper
+      - name: Make Maven Wrapper executable
+        run: chmod +x mvnw
+
+      # Verify environment
       - name: Verify Java and Maven
         run: |
           java -version
           ./mvnw --version
 
+      # Compile all source code
       - name: Compile project
         run: ./mvnw -B clean compile
 
+      # Execute unit tests
       - name: Run unit tests
         run: ./mvnw -B test
 
+      # Build project artifacts
       - name: Package project
         run: ./mvnw -B package -DskipTests
 
+      # Upload test reports even if earlier steps fail
       - name: Upload test reports
         if: always()
         uses: actions/upload-artifact@v4
