@@ -4,7 +4,6 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.astradb.common.time.HybridTimestamp;
 import java.nio.file.Path;
-import java.util.Optional;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -30,14 +29,14 @@ class RocksDbMvccStoreTests {
     try (RocksDbMvccStore<String, String> store = openStore(tempDir.resolve("db"))) {
       store.put("name", "AstraDB", timestamp(100));
 
-      assertEquals(Optional.of("AstraDB"), store.get("name", timestamp(100)));
+      assertEquals("AstraDB", store.get("name", timestamp(100)));
     }
   }
 
   @Test
-  void shouldReturnEmptyForMissingKey() throws RocksDBException {
+  void shouldReturnNullForMissingKey() throws RocksDBException {
     try (RocksDbMvccStore<String, String> store = openStore(tempDir.resolve("db"))) {
-      assertEquals(Optional.empty(), store.get("missing", timestamp(100)));
+      assertNull(store.get("missing", timestamp(100)));
     }
   }
 
@@ -47,10 +46,10 @@ class RocksDbMvccStoreTests {
       store.put("key", "v1", timestamp(100));
       store.put("key", "v2", timestamp(200));
 
-      assertEquals(Optional.of("v1"), store.get("key", timestamp(100)));
-      assertEquals(Optional.of("v1"), store.get("key", timestamp(150)));
-      assertEquals(Optional.of("v2"), store.get("key", timestamp(200)));
-      assertEquals(Optional.of("v2"), store.get("key", timestamp(300)));
+      assertEquals("v1", store.get("key", timestamp(100)));
+      assertEquals("v1", store.get("key", timestamp(150)));
+      assertEquals("v2", store.get("key", timestamp(200)));
+      assertEquals("v2", store.get("key", timestamp(300)));
     }
   }
 
@@ -60,9 +59,9 @@ class RocksDbMvccStoreTests {
       store.put("key", "value", timestamp(100));
       store.delete("key", timestamp(200));
 
-      assertEquals(Optional.of("value"), store.get("key", timestamp(150)));
-      assertEquals(Optional.empty(), store.get("key", timestamp(200)));
-      assertEquals(Optional.empty(), store.get("key", timestamp(300)));
+      assertEquals("value", store.get("key", timestamp(150)));
+      assertNull(store.get("key", timestamp(200)));
+      assertNull(store.get("key", timestamp(300)));
     }
   }
 
@@ -76,7 +75,7 @@ class RocksDbMvccStoreTests {
     }
 
     try (RocksDbMvccStore<String, String> reopenedStore = openStore(databasePath)) {
-      assertEquals(Optional.of("persistent-value"), reopenedStore.get("key", timestamp(100)));
+      assertEquals("persistent-value", reopenedStore.get("key", timestamp(100)));
     }
   }
 
@@ -91,8 +90,8 @@ class RocksDbMvccStoreTests {
     }
 
     try (RocksDbMvccStore<String, String> reopenedStore = openStore(databasePath)) {
-      assertEquals(Optional.of("v1"), reopenedStore.get("key", timestamp(150)));
-      assertEquals(Optional.of("v2"), reopenedStore.get("key", timestamp(200)));
+      assertEquals("v1", reopenedStore.get("key", timestamp(150)));
+      assertEquals("v2", reopenedStore.get("key", timestamp(200)));
     }
   }
 
@@ -113,7 +112,7 @@ class RocksDbMvccStoreTests {
 
       store.put(key, value, timestamp(100));
 
-      assertEquals(Optional.of(value), store.get(key, timestamp(100)));
+      assertEquals(value, store.get(key, timestamp(100)));
     }
   }
 
@@ -149,7 +148,6 @@ class RocksDbMvccStoreTests {
 
       int numberOfWrites = 8;
       CountDownLatch startLatch = new CountDownLatch(1);
-
       Future<?>[] futures = new Future<?>[numberOfWrites];
 
       for (int i = 0; i < numberOfWrites; i++) {
@@ -159,9 +157,7 @@ class RocksDbMvccStoreTests {
             executor.submit(
                 () -> {
                   startLatch.await();
-
                   store.put("shared-key", "value-" + version, timestamp(version + 1));
-
                   return null;
                 });
       }
@@ -173,8 +169,8 @@ class RocksDbMvccStoreTests {
       }
 
       for (int i = 1; i <= numberOfWrites; i++) {
-        assertTrue(
-            store.get("shared-key", timestamp(i)).isPresent(),
+        assertNotNull(
+            store.get("shared-key", timestamp(i)),
             "Version at timestamp " + i + " should be visible");
       }
     }

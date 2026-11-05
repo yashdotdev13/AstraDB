@@ -4,19 +4,15 @@ import io.astradb.common.time.HybridTimestamp;
 import io.astradb.storage.mvcc.VersionChain;
 import io.astradb.storage.mvcc.VersionedValue;
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.List;
 import java.util.Objects;
-import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.locks.ReentrantLock;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
 
-/**
- * Persistent MVCC storage engine backed by RocksDB.
- *
- * <p>Each key maps to a serialized version chain containing its complete MVCC history.
- *
- * @param <K> key type
- * @param <V> value type
- */
 public final class RocksDbMvccStore<K, V> implements AutoCloseable {
 
   private static final int LOCK_STRIPES = 256;
@@ -31,44 +27,21 @@ public final class RocksDbMvccStore<K, V> implements AutoCloseable {
       KeySerializer<K> keySerializer,
       VersionChainSerializer<V> versionChainSerializer) {
 
-    this.rocksDbStore = rocksDbStore;
-    this.keySerializer = keySerializer;
-    this.versionChainSerializer = versionChainSerializer;
+    this.rocksDbStore = Objects.requireNonNull(rocksDbStore);
+    this.keySerializer = Objects.requireNonNull(keySerializer);
+    this.versionChainSerializer = Objects.requireNonNull(versionChainSerializer);
   }
 
-  /**
-   * Opens or creates a persistent MVCC store.
-   *
-   * @param path database directory
-   * @param keySerializer key serializer
-   * @param valueSerializer value serializer
-   * @param <K> key type
-   * @param <V> value type
-   * @return opened persistent MVCC store
-   * @throws RocksDBException if the database cannot be opened
-   */
   public static <K, V> RocksDbMvccStore<K, V> open(
-      Path path, KeySerializer<K> keySerializer, ValueSerializer<V> valueSerializer)
+      Path databasePath, KeySerializer<K> keySerializer, ValueSerializer<V> valueSerializer)
       throws RocksDBException {
 
-    Objects.requireNonNull(path, "Database path must not be null");
-    Objects.requireNonNull(keySerializer, "Key serializer must not be null");
-    Objects.requireNonNull(valueSerializer, "Value serializer must not be null");
-
-    RocksDbStore rocksDbStore = RocksDbStore.open(path);
+    RocksDbStore rocksDbStore = RocksDbStore.open(databasePath);
 
     return new RocksDbMvccStore<>(
         rocksDbStore, keySerializer, new VersionChainSerializer<>(valueSerializer));
   }
 
-  /**
-   * Adds a new version for the specified key.
-   *
-   * @param key key to store
-   * @param value value to store
-   * @param timestamp version timestamp
-   * @throws RocksDBException if persistence fails
-   */
   public void put(K key, V value, HybridTimestamp timestamp) throws RocksDBException {
     Objects.requireNonNull(key, "Key must not be null");
     Objects.requireNonNull(value, "Value must not be null");
@@ -78,24 +51,18 @@ public final class RocksDbMvccStore<K, V> implements AutoCloseable {
     lock.lock();
 
     try {
-      byte[] serializedKey = keySerializer.serialize(key);
-      VersionChain<V> chain = readVersionChain(serializedKey);
-
+      VersionChain<V> chain = readVersionChain(key);
       chain.add(VersionedValue.of(timestamp, value));
 
-      rocksDbStore.put(serializedKey, versionChainSerializer.serialize(chain));
+      byte[] serializedKey = keySerializer.serialize(key);
+      byte[] serializedChain = versionChainSerializer.serialize(chain);
+
+      rocksDbStore.put(serializedKey, serializedChain);
     } finally {
       lock.unlock();
     }
   }
 
-  /**
-   * Marks the specified key as deleted at the given timestamp.
-   *
-   * @param key key to delete
-   * @param timestamp deletion timestamp
-   * @throws RocksDBException if persistence fails
-   */
   public void delete(K key, HybridTimestamp timestamp) throws RocksDBException {
     Objects.requireNonNull(key, "Key must not be null");
     Objects.requireNonNull(timestamp, "Timestamp must not be null");
@@ -104,39 +71,93 @@ public final class RocksDbMvccStore<K, V> implements AutoCloseable {
     lock.lock();
 
     try {
-      byte[] serializedKey = keySerializer.serialize(key);
-      VersionChain<V> chain = readVersionChain(serializedKey);
-
+      VersionChain<V> chain = readVersionChain(key);
       chain.add(VersionedValue.tombstone(timestamp));
 
-      rocksDbStore.put(serializedKey, versionChainSerializer.serialize(chain));
+      byte[] serializedKey = keySerializer.serialize(key);
+      byte[] serializedChain = versionChainSerializer.serialize(chain);
+
+      rocksDbStore.put(serializedKey, serializedChain);
+    } finally {
+      lock.unlock();
+    }
+  }
+
+  public V get(K key, HybridTimestamp timestamp) throws RocksDBException {
+    Objects.requireNonNull(key, "Key must not be null");
+    Objects.requireNonNull(timestamp, "Timestamp must not be null");
+
+    ReentrantLock lock = getKeyLock(key);
+    lock.lock();
+
+    try {
+      VersionChain<V> chain = readVersionChain(key);
+      return chain.get(timestamp).orElse(null);
     } finally {
       lock.unlock();
     }
   }
 
   /**
-   * Reads the value visible to the specified snapshot.
+   * Applies multiple mutations atomically using RocksDB WriteBatch.
    *
-   * @param key key to read
-   * @param snapshotTimestamp snapshot timestamp
-   * @return visible value, or empty if absent or deleted
-   * @throws RocksDBException if the read fails
+   * <p>Duplicate keys within a batch are rejected because a single transaction timestamp cannot
+   * represent multiple versions of the same key.
    */
-  public Optional<V> get(K key, HybridTimestamp snapshotTimestamp) throws RocksDBException {
-    Objects.requireNonNull(key, "Key must not be null");
-    Objects.requireNonNull(snapshotTimestamp, "Snapshot timestamp must not be null");
+  void applyBatch(List<BatchOperation<K, V>> operations, HybridTimestamp timestamp)
+      throws RocksDBException {
 
-    byte[] serializedKey = keySerializer.serialize(key);
-    byte[] serializedChain = rocksDbStore.get(serializedKey);
+    Objects.requireNonNull(operations, "Operations must not be null");
+    Objects.requireNonNull(timestamp, "Timestamp must not be null");
 
-    if (serializedChain == null) {
-      return Optional.empty();
+    if (operations.isEmpty()) {
+      throw new IllegalArgumentException("Batch must contain at least one operation");
     }
 
-    VersionChain<V> chain = versionChainSerializer.deserialize(serializedChain);
+    Set<K> uniqueKeys = new HashSet<>();
+    List<K> keys = new ArrayList<>(operations.size());
 
-    return chain.get(snapshotTimestamp);
+    for (BatchOperation<K, V> operation : operations) {
+      Objects.requireNonNull(operation, "Batch operation must not be null");
+
+      K key = operation.getKey();
+
+      if (!uniqueKeys.add(key)) {
+        throw new IllegalArgumentException("Duplicate key in batch: " + key);
+      }
+
+      keys.add(key);
+    }
+
+    List<ReentrantLock> acquiredLocks = acquireLocks(keys);
+
+    try (WriteBatch writeBatch = new WriteBatch()) {
+      for (BatchOperation<K, V> operation : operations) {
+        K key = operation.getKey();
+
+        VersionChain<V> chain = readVersionChain(key);
+
+        if (operation.getType() == BatchOperation.Type.PUT) {
+          chain.add(VersionedValue.of(timestamp, operation.getValue()));
+        } else {
+          chain.add(VersionedValue.tombstone(timestamp));
+        }
+
+        byte[] serializedKey = keySerializer.serialize(key);
+        byte[] serializedChain = versionChainSerializer.serialize(chain);
+
+        writeBatch.put(serializedKey, serializedChain);
+      }
+
+      rocksDbStore.write(writeBatch);
+    } finally {
+      releaseLocks(acquiredLocks);
+    }
+  }
+
+  private VersionChain<V> readVersionChain(K key) throws RocksDBException {
+    byte[] serializedKey = keySerializer.serialize(key);
+    return readVersionChain(serializedKey);
   }
 
   private VersionChain<V> readVersionChain(byte[] serializedKey) throws RocksDBException {
@@ -149,14 +170,44 @@ public final class RocksDbMvccStore<K, V> implements AutoCloseable {
     return versionChainSerializer.deserialize(serializedChain);
   }
 
-  /** Flushes pending writes to persistent storage. */
-  public void flush() throws RocksDBException {
-    rocksDbStore.flush();
+  VersionChain<V> readVersionChainForKey(K key) throws RocksDBException {
+    Objects.requireNonNull(key, "Key must not be null");
+    return readVersionChain(key);
+  }
+
+  private List<ReentrantLock> acquireLocks(List<K> keys) {
+    Set<Integer> lockIndexes = new HashSet<>();
+
+    for (K key : keys) {
+      lockIndexes.add(getLockIndex(key));
+    }
+
+    List<Integer> sortedIndexes = new ArrayList<>(lockIndexes);
+    sortedIndexes.sort(Integer::compareTo);
+
+    List<ReentrantLock> acquiredLocks = new ArrayList<>(sortedIndexes.size());
+
+    for (Integer index : sortedIndexes) {
+      ReentrantLock lock = locks[index];
+      lock.lock();
+      acquiredLocks.add(lock);
+    }
+
+    return acquiredLocks;
+  }
+
+  private void releaseLocks(List<ReentrantLock> acquiredLocks) {
+    for (int i = acquiredLocks.size() - 1; i >= 0; i--) {
+      acquiredLocks.get(i).unlock();
+    }
   }
 
   private ReentrantLock getKeyLock(K key) {
-    int index = Math.floorMod(key.hashCode(), LOCK_STRIPES);
-    return locks[index];
+    return locks[getLockIndex(key)];
+  }
+
+  private int getLockIndex(K key) {
+    return Math.floorMod(key.hashCode(), LOCK_STRIPES);
   }
 
   private static ReentrantLock[] createLocks() {
@@ -169,7 +220,10 @@ public final class RocksDbMvccStore<K, V> implements AutoCloseable {
     return locks;
   }
 
-  /** Closes the underlying RocksDB database. */
+  public void flush() throws RocksDBException {
+    rocksDbStore.flush();
+  }
+
   @Override
   public void close() {
     rocksDbStore.close();

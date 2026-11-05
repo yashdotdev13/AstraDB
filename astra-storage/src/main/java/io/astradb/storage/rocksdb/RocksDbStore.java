@@ -6,11 +6,14 @@ import org.rocksdb.FlushOptions;
 import org.rocksdb.Options;
 import org.rocksdb.RocksDB;
 import org.rocksdb.RocksDBException;
+import org.rocksdb.WriteBatch;
+import org.rocksdb.WriteOptions;
 
 /**
  * Persistent key-value storage backed by RocksDB.
  *
- * <p>Provides basic storage operations for byte-array keys and values.
+ * <p>Provides basic storage operations for byte-array keys and values, including atomic batch
+ * writes.
  */
 public final class RocksDbStore implements AutoCloseable {
 
@@ -34,6 +37,7 @@ public final class RocksDbStore implements AutoCloseable {
    * @throws RocksDBException if the database cannot be opened
    */
   public static RocksDbStore open(Path path) throws RocksDBException {
+
     Objects.requireNonNull(path, "Database path must not be null");
 
     Options options = new Options().setCreateIfMissing(true);
@@ -55,10 +59,28 @@ public final class RocksDbStore implements AutoCloseable {
    * @throws RocksDBException if the write fails
    */
   public void put(byte[] key, byte[] value) throws RocksDBException {
+
     Objects.requireNonNull(key, "Key must not be null");
     Objects.requireNonNull(value, "Value must not be null");
 
     database.put(key, value);
+  }
+
+  /**
+   * Atomically applies multiple puts and deletes.
+   *
+   * <p>All operations in the batch are applied atomically by RocksDB.
+   *
+   * @param batch prepared RocksDB write batch
+   * @throws RocksDBException if the write fails
+   */
+  public void write(WriteBatch batch) throws RocksDBException {
+
+    Objects.requireNonNull(batch, "Write batch must not be null");
+
+    try (WriteOptions writeOptions = new WriteOptions()) {
+      database.write(writeOptions, batch);
+    }
   }
 
   /**
@@ -69,6 +91,7 @@ public final class RocksDbStore implements AutoCloseable {
    * @throws RocksDBException if the read fails
    */
   public byte[] get(byte[] key) throws RocksDBException {
+
     Objects.requireNonNull(key, "Key must not be null");
 
     return database.get(key);
@@ -81,6 +104,7 @@ public final class RocksDbStore implements AutoCloseable {
    * @throws RocksDBException if the deletion fails
    */
   public void delete(byte[] key) throws RocksDBException {
+
     Objects.requireNonNull(key, "Key must not be null");
 
     database.delete(key);
@@ -92,6 +116,7 @@ public final class RocksDbStore implements AutoCloseable {
    * @throws RocksDBException if the flush fails
    */
   public void flush() throws RocksDBException {
+
     try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
       database.flush(flushOptions);
     }
@@ -99,6 +124,7 @@ public final class RocksDbStore implements AutoCloseable {
 
   @Override
   public void close() {
+
     try {
       database.close();
     } finally {
