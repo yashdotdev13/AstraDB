@@ -1,5 +1,7 @@
 package io.astradb.raft.log;
 
+import io.astradb.raft.metadata.RaftMetadata;
+import io.astradb.raft.metadata.RaftMetadataStore;
 import io.astradb.storage.rocksdb.BatchOperation;
 import io.astradb.storage.rocksdb.RocksDbStore;
 import java.nio.ByteBuffer;
@@ -13,12 +15,15 @@ import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.rocksdb.RocksDBException;
 
 /** RocksDB-backed persistent storage for the Raft replicated log. */
-public final class RocksDbRaftLogStore implements RaftLogStore {
+public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStore {
 
   private static final byte[] ENTRY_PREFIX = "raft:entry:".getBytes(StandardCharsets.UTF_8);
 
   private static final byte[] LAST_INDEX_KEY =
       "raft:metadata:last-index".getBytes(StandardCharsets.UTF_8);
+
+  private static final byte[] RAFT_METADATA_KEY =
+      "raft:metadata:state".getBytes(StandardCharsets.UTF_8);
 
   private final RocksDbStore store;
   private final RaftLogSerializer serializer;
@@ -42,10 +47,27 @@ public final class RocksDbRaftLogStore implements RaftLogStore {
   public static RocksDbRaftLogStore open(Path databasePath) {
     Objects.requireNonNull(databasePath, "Database path must not be null");
 
+    RocksDbStore store = null;
+
     try {
-      return new RocksDbRaftLogStore(RocksDbStore.open(databasePath));
+      store = RocksDbStore.open(databasePath);
+      return new RocksDbRaftLogStore(store);
     } catch (RocksDBException exception) {
+      closeQuietly(store);
       throw new RaftLogException("Failed to open Raft log database", exception);
+    } catch (RuntimeException exception) {
+      closeQuietly(store);
+      throw exception;
+    }
+  }
+
+  private static void closeQuietly(RocksDbStore store) {
+    if (store != null) {
+      try {
+        store.close();
+      } catch (RuntimeException ignored) {
+        // Preserve the original exception.
+      }
     }
   }
 
@@ -284,6 +306,96 @@ public final class RocksDbRaftLogStore implements RaftLogStore {
     }
   }
 
+  @Override
+  public RaftMetadata loadMetadata() {
+    lock.readLock().lock();
+    try {
+      byte[] data = store.get(RAFT_METADATA_KEY);
+
+      if (data == null) {
+        return new RaftMetadata(0, null);
+      }
+
+      return deserializeMetadata(data);
+    } catch (RocksDBException exception) {
+      throw new RaftLogException("Failed to load Raft metadata", exception);
+    } finally {
+      lock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public void saveMetadata(RaftMetadata metadata) {
+    Objects.requireNonNull(metadata, "Raft metadata must not be null");
+
+    lock.writeLock().lock();
+    try {
+      byte[] serialized = serializeMetadata(metadata);
+
+      store.writeBatch(List.of(BatchOperation.put(RAFT_METADATA_KEY, serialized)), true);
+    } catch (RocksDBException exception) {
+      throw new RaftLogException("Failed to save Raft metadata", exception);
+    } finally {
+      lock.writeLock().unlock();
+    }
+  }
+
+  private static byte[] serializeMetadata(RaftMetadata metadata) {
+    byte[] votedFor =
+        metadata.getVotedFor().map(value -> value.getBytes(StandardCharsets.UTF_8)).orElse(null);
+
+    int votedForLength = votedFor == null ? -1 : votedFor.length;
+
+    ByteBuffer buffer =
+        ByteBuffer.allocate(Long.BYTES + Integer.BYTES + Math.max(votedForLength, 0));
+
+    buffer.putLong(metadata.getCurrentTerm());
+    buffer.putInt(votedForLength);
+
+    if (votedFor != null) {
+      buffer.put(votedFor);
+    }
+
+    return buffer.array();
+  }
+
+  private static RaftMetadata deserializeMetadata(byte[] data) {
+    if (data.length < Long.BYTES + Integer.BYTES) {
+      throw new RaftLogException("Corrupted Raft metadata: incomplete data");
+    }
+
+    ByteBuffer buffer = ByteBuffer.wrap(data);
+
+    long currentTerm = buffer.getLong();
+    int votedForLength = buffer.getInt();
+
+    if (votedForLength < -1) {
+      throw new RaftLogException("Corrupted Raft metadata: invalid candidate length");
+    }
+
+    if (votedForLength == -1 && buffer.hasRemaining()) {
+      throw new RaftLogException("Corrupted Raft metadata: unexpected candidate data");
+    }
+
+    if (votedForLength >= 0 && votedForLength != buffer.remaining()) {
+      throw new RaftLogException("Corrupted Raft metadata: invalid candidate length");
+    }
+
+    String votedFor = null;
+
+    if (votedForLength >= 0) {
+      byte[] candidateBytes = new byte[votedForLength];
+      buffer.get(candidateBytes);
+      votedFor = new String(candidateBytes, StandardCharsets.UTF_8);
+    }
+
+    try {
+      return new RaftMetadata(currentTerm, votedFor);
+    } catch (IllegalArgumentException exception) {
+      throw new RaftLogException("Corrupted Raft metadata", exception);
+    }
+  }
+
   private RaftLogEntry readEntry(long index) {
     try {
       byte[] data = store.get(entryKey(index));
@@ -338,20 +450,21 @@ public final class RocksDbRaftLogStore implements RaftLogStore {
   }
 
   private void validateRecoveredLog() {
-    if (lastLogIndex == 0) {
-      return;
-    }
+    for (long index = 1; index <= lastLogIndex; index++) {
+      RaftLogEntry entry = readEntry(index);
 
-    RaftLogEntry lastEntry = readEntry(lastLogIndex);
+      if (entry == null) {
+        throw new RaftLogException("Raft log contains a missing entry at index " + index);
+      }
 
-    if (lastEntry == null) {
-      throw new RaftLogException(
-          "Raft log metadata references missing entry at index " + lastLogIndex);
-    }
+      if (entry.getIndex() != index) {
+        throw new RaftLogException(
+            "Raft log entry index mismatch: expected " + index + " but found " + entry.getIndex());
+      }
 
-    if (lastEntry.getIndex() != lastLogIndex) {
-      throw new RaftLogException(
-          "Raft log entry index does not match metadata at index " + lastLogIndex);
+      if (index == Long.MAX_VALUE) {
+        break;
+      }
     }
   }
 

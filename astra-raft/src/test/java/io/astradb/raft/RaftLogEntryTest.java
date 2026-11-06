@@ -1,7 +1,8 @@
-package io.astradb.raft.log;
+package io.astradb.raft;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.astradb.raft.log.RaftLogEntry;
 import org.junit.jupiter.api.Test;
 
 class RaftLogEntryTest {

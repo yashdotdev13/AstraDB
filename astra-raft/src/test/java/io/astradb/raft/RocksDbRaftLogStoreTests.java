@@ -1,10 +1,17 @@
-package io.astradb.raft.log;
+package io.astradb.raft;
 
 import static org.junit.jupiter.api.Assertions.*;
 
+import io.astradb.raft.log.RaftLogEntry;
+import io.astradb.raft.log.RaftLogException;
+import io.astradb.raft.log.RocksDbRaftLogStore;
+import io.astradb.raft.metadata.RaftMetadata;
+import io.astradb.storage.rocksdb.RocksDbStore;
+import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.List;
+import java.util.Optional;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -223,6 +230,79 @@ class RocksDbRaftLogStoreTests {
         () -> store.replaceSuffix(2, List.of(new RaftLogEntry(3, 2, new byte[] {3}))));
 
     assertEquals(1, store.getLastLogIndex());
+
+    store.close();
+  }
+
+  @Test
+  void shouldRejectRecoveryWhenMiddleEntryIsMissing() throws Exception {
+    Path databasePath = tempDir.resolve("missing-middle-entry-test");
+
+    RocksDbRaftLogStore store = RocksDbRaftLogStore.open(databasePath);
+
+    store.appendAll(
+        List.of(
+            new RaftLogEntry(1, 1, new byte[] {1}),
+            new RaftLogEntry(2, 1, new byte[] {2}),
+            new RaftLogEntry(3, 2, new byte[] {3})));
+
+    store.close();
+
+    // Remove entry 2 directly from RocksDB to simulate persisted corruption.
+    RocksDbStore rawStore = RocksDbStore.open(databasePath);
+    byte[] prefix = "raft:entry:".getBytes(StandardCharsets.UTF_8);
+    byte[] missingKey =
+        ByteBuffer.allocate(prefix.length + Long.BYTES).put(prefix).putLong(2).array();
+
+    rawStore.delete(missingKey);
+    rawStore.close();
+
+    assertThrows(RaftLogException.class, () -> RocksDbRaftLogStore.open(databasePath));
+  }
+
+  @Test
+  void shouldReturnDefaultMetadataForNewDatabase(@TempDir Path tempDir) {
+    RocksDbRaftLogStore store = RocksDbRaftLogStore.open(tempDir.resolve("default-metadata-test"));
+
+    RaftMetadata metadata = store.loadMetadata();
+
+    assertEquals(0, metadata.getCurrentTerm());
+    assertTrue(metadata.getVotedFor().isEmpty());
+
+    store.close();
+  }
+
+  @Test
+  void shouldPersistMetadataAfterReopening(@TempDir Path tempDir) {
+    Path databasePath = tempDir.resolve("metadata-persistence-test");
+
+    RocksDbRaftLogStore store = RocksDbRaftLogStore.open(databasePath);
+    store.saveMetadata(new RaftMetadata(5, "node-2"));
+    store.close();
+
+    RocksDbRaftLogStore reopened = RocksDbRaftLogStore.open(databasePath);
+
+    RaftMetadata metadata = reopened.loadMetadata();
+
+    assertEquals(5, metadata.getCurrentTerm());
+    assertEquals(Optional.of("node-2"), metadata.getVotedFor());
+
+    reopened.close();
+  }
+
+  @Test
+  void shouldPersistUpdatedTermAndClearedVote(@TempDir Path tempDir) {
+    Path databasePath = tempDir.resolve("metadata-update-test");
+
+    RocksDbRaftLogStore store = RocksDbRaftLogStore.open(databasePath);
+
+    store.saveMetadata(new RaftMetadata(5, "node-2"));
+    store.saveMetadata(new RaftMetadata(6, null));
+
+    RaftMetadata metadata = store.loadMetadata();
+
+    assertEquals(6, metadata.getCurrentTerm());
+    assertTrue(metadata.getVotedFor().isEmpty());
 
     store.close();
   }
