@@ -67,18 +67,27 @@ public final class RocksDbStore implements AutoCloseable {
   }
 
   /**
-   * Atomically applies multiple puts and deletes.
-   *
-   * <p>All operations in the batch are applied atomically by RocksDB.
+   * Atomically applies a batch using the default RocksDB durability settings.
    *
    * @param batch prepared RocksDB write batch
    * @throws RocksDBException if the write fails
    */
   public void write(WriteBatch batch) throws RocksDBException {
+    write(batch, false);
+  }
+
+  /**
+   * Atomically applies a batch with configurable synchronous durability.
+   *
+   * @param batch prepared RocksDB write batch
+   * @param sync whether to synchronously persist the WAL
+   * @throws RocksDBException if the write fails
+   */
+  public void write(WriteBatch batch, boolean sync) throws RocksDBException {
 
     Objects.requireNonNull(batch, "Write batch must not be null");
 
-    try (WriteOptions writeOptions = new WriteOptions()) {
+    try (WriteOptions writeOptions = new WriteOptions().setSync(sync)) {
       database.write(writeOptions, batch);
     }
   }
@@ -119,6 +128,37 @@ public final class RocksDbStore implements AutoCloseable {
 
     try (FlushOptions flushOptions = new FlushOptions().setWaitForFlush(true)) {
       database.flush(flushOptions);
+    }
+  }
+
+  /**
+   * Atomically applies a collection of put and delete operations.
+   *
+   * @param operations operations to apply
+   * @param sync whether to synchronously persist the WAL
+   * @throws RocksDBException if the batch write fails
+   */
+  public void writeBatch(java.util.List<BatchOperation<byte[], byte[]>> operations, boolean sync)
+      throws RocksDBException {
+
+    Objects.requireNonNull(operations, "Operations must not be null");
+
+    if (operations.isEmpty()) {
+      throw new IllegalArgumentException("Batch must contain at least one operation");
+    }
+
+    try (WriteBatch batch = new WriteBatch()) {
+      for (BatchOperation<byte[], byte[]> operation : operations) {
+        Objects.requireNonNull(operation, "Batch operation must not be null");
+
+        if (operation.getType() == BatchOperation.Type.PUT) {
+          batch.put(operation.getKey(), operation.getValue());
+        } else {
+          batch.delete(operation.getKey());
+        }
+      }
+
+      write(batch, sync);
     }
   }
 
