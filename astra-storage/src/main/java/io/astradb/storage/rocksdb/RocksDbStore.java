@@ -67,18 +67,27 @@ public final class RocksDbStore implements AutoCloseable {
   }
 
   /**
-   * Atomically applies multiple puts and deletes.
-   *
-   * <p>All operations in the batch are applied atomically by RocksDB.
+   * Atomically applies a batch using the default RocksDB durability settings.
    *
    * @param batch prepared RocksDB write batch
    * @throws RocksDBException if the write fails
    */
   public void write(WriteBatch batch) throws RocksDBException {
+    write(batch, false);
+  }
+
+  /**
+   * Atomically applies a batch with configurable synchronous durability.
+   *
+   * @param batch prepared RocksDB write batch
+   * @param sync whether to synchronously persist the WAL
+   * @throws RocksDBException if the write fails
+   */
+  public void write(WriteBatch batch, boolean sync) throws RocksDBException {
 
     Objects.requireNonNull(batch, "Write batch must not be null");
 
-    try (WriteOptions writeOptions = new WriteOptions()) {
+    try (WriteOptions writeOptions = new WriteOptions().setSync(sync)) {
       database.write(writeOptions, batch);
     }
   }

@@ -20,5 +20,11 @@
             <artifactId>astra-protocol</artifactId>
             <version>${project.version}</version>
         </dependency>
+
+        <dependency>
+            <groupId>io.astradb</groupId>
+            <artifactId>astra-storage</artifactId>
+            <version>${project.version}</version>
+        </dependency>
     </dependencies>
 </project>
