@@ -131,6 +131,37 @@ public final class RocksDbStore implements AutoCloseable {
     }
   }
 
+  /**
+   * Atomically applies a collection of put and delete operations.
+   *
+   * @param operations operations to apply
+   * @param sync whether to synchronously persist the WAL
+   * @throws RocksDBException if the batch write fails
+   */
+  public void writeBatch(java.util.List<BatchOperation<byte[], byte[]>> operations, boolean sync)
+      throws RocksDBException {
+
+    Objects.requireNonNull(operations, "Operations must not be null");
+
+    if (operations.isEmpty()) {
+      throw new IllegalArgumentException("Batch must contain at least one operation");
+    }
+
+    try (WriteBatch batch = new WriteBatch()) {
+      for (BatchOperation<byte[], byte[]> operation : operations) {
+        Objects.requireNonNull(operation, "Batch operation must not be null");
+
+        if (operation.getType() == BatchOperation.Type.PUT) {
+          batch.put(operation.getKey(), operation.getValue());
+        } else {
+          batch.delete(operation.getKey());
+        }
+      }
+
+      write(batch, sync);
+    }
+  }
+
   @Override
   public void close() {
 

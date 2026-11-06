@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.List;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.rocksdb.RocksDBException;
@@ -93,6 +94,39 @@ class RocksDbStoreTests {
     try (RocksDbStore reopenedStore = RocksDbStore.open(databasePath)) {
       assertArrayEquals(bytes("entry-1"), reopenedStore.get(bytes("raft:log:1")));
       assertArrayEquals(bytes("entry-2"), reopenedStore.get(bytes("raft:log:2")));
+    }
+  }
+
+  @Test
+  void shouldApplyPutAndDeleteOperationsAtomically() throws RocksDBException {
+    try (RocksDbStore store = RocksDbStore.open(tempDir.resolve("batch-database"))) {
+      store.put(bytes("delete-key"), bytes("old-value"));
+
+      List<BatchOperation<byte[], byte[]>> operations =
+          List.of(
+              BatchOperation.put(bytes("key-1"), bytes("value-1")),
+              BatchOperation.put(bytes("key-2"), bytes("value-2")),
+              BatchOperation.delete(bytes("delete-key")));
+
+      store.writeBatch(operations, true);
+
+      assertArrayEquals(bytes("value-1"), store.get(bytes("key-1")));
+      assertArrayEquals(bytes("value-2"), store.get(bytes("key-2")));
+      assertNull(store.get(bytes("delete-key")));
+    }
+  }
+
+  @Test
+  void shouldRejectEmptyBatch() throws RocksDBException {
+    try (RocksDbStore store = RocksDbStore.open(tempDir.resolve("empty-batch-database"))) {
+      assertThrows(IllegalArgumentException.class, () -> store.writeBatch(List.of(), true));
+    }
+  }
+
+  @Test
+  void shouldRejectNullBatch() throws RocksDBException {
+    try (RocksDbStore store = RocksDbStore.open(tempDir.resolve("null-batch-database"))) {
+      assertThrows(NullPointerException.class, () -> store.writeBatch(null, true));
     }
   }
 
