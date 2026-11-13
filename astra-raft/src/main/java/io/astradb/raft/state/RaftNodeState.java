@@ -67,6 +67,31 @@ public final class RaftNodeState {
     role = RaftRole.FOLLOWER;
   }
 
+  /** Advances to a higher term only if it exceeds the current term. */
+  public synchronized boolean advanceTermIfHigher(long newTerm) {
+    if (newTerm <= currentTerm) {
+      return false;
+    }
+
+    metadataStore.saveMetadata(new RaftMetadata(newTerm, null));
+
+    currentTerm = newTerm;
+    votedFor = null;
+    role = RaftRole.FOLLOWER;
+
+    return true;
+  }
+
+  /** Becomes leader only if the node is still a candidate in the expected term. */
+  public synchronized boolean becomeLeader(long expectedTerm) {
+    if (currentTerm != expectedTerm || role != RaftRole.CANDIDATE) {
+      return false;
+    }
+
+    role = RaftRole.LEADER;
+    return true;
+  }
+
   /**
    * Processes a vote request atomically with respect to other node state transitions.
    *
