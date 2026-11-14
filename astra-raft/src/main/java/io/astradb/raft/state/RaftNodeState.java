@@ -82,6 +82,27 @@ public final class RaftNodeState {
     return true;
   }
 
+  /**
+   * Accepts an AppendEntries request from a leader in the current or a higher term.
+   *
+   * @return true if the leader's term is current or higher
+   */
+  public synchronized boolean acceptLeaderTerm(long leaderTerm) {
+    if (leaderTerm < currentTerm) {
+      return false;
+    }
+
+    if (leaderTerm > currentTerm) {
+      metadataStore.saveMetadata(new RaftMetadata(leaderTerm, null));
+
+      currentTerm = leaderTerm;
+      votedFor = null;
+    }
+
+    role = RaftRole.FOLLOWER;
+    return true;
+  }
+
   /** Becomes leader only if the node is still a candidate in the expected term. */
   public synchronized boolean becomeLeader(long expectedTerm) {
     if (currentTerm != expectedTerm || role != RaftRole.CANDIDATE) {

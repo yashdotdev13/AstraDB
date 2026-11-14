@@ -10,8 +10,7 @@ import io.astradb.raft.log.RaftLogEntry;
 import io.astradb.raft.log.RaftLogStore;
 import io.astradb.raft.metadata.RaftMetadata;
 import io.astradb.raft.metadata.RaftMetadataStore;
-import io.astradb.raft.rpc.RequestVoteRequest;
-import io.astradb.raft.rpc.RequestVoteResponse;
+import io.astradb.raft.rpc.*;
 import io.astradb.raft.state.RaftNodeState;
 import io.astradb.raft.state.RaftRole;
 import java.util.ArrayList;
@@ -176,6 +175,51 @@ class RaftElectionCoordinatorLifecycleTests {
     coordinator.start();
 
     assertEquals(1, scheduler.getScheduledTaskCount());
+  }
+
+  @Test
+  void shouldResetElectionTimeoutAfterLeaderCommunication() {
+    coordinator.start();
+
+    assertEquals(1, scheduler.getScheduledTaskCount());
+
+    coordinator.resetElectionTimeout();
+
+    assertEquals(1, scheduler.getScheduledTaskCount());
+    assertEquals(150, scheduler.getLastScheduledDelayMillis());
+
+    // The previous timeout was cancelled, so only the new timeout can fire.
+    scheduler.runNextTask();
+
+    assertEquals(1, nodeState.getCurrentTerm());
+    assertEquals(RaftRole.CANDIDATE, nodeState.getRole());
+  }
+
+  @Test
+  void shouldResetElectionTimeoutWhenAppendEntriesIsReceived() {
+    nodeState.startElection("node-1");
+    coordinator.start();
+
+    assertEquals(RaftRole.CANDIDATE, nodeState.getRole());
+    assertEquals(1, scheduler.getScheduledTaskCount());
+
+    AppendEntriesHandler handler = new AppendEntriesHandler(nodeState, logStore, coordinator);
+
+    AppendEntriesRequest request = new AppendEntriesRequest(1, "node-2", 0, 0, List.of(), 0);
+
+    AppendEntriesResponse response = handler.handle(request);
+
+    assertTrue(response.isSuccess());
+    assertEquals(RaftRole.FOLLOWER, nodeState.getRole());
+    assertEquals(1, nodeState.getCurrentTerm());
+
+    // The old timeout was cancelled and a fresh timeout was scheduled.
+    assertEquals(1, scheduler.getScheduledTaskCount());
+
+    scheduler.runNextTask();
+
+    assertEquals(2, nodeState.getCurrentTerm());
+    assertEquals(RaftRole.CANDIDATE, nodeState.getRole());
   }
 
   private static final class FixedRandomGenerator implements java.util.random.RandomGenerator {
