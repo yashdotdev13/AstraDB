@@ -1,6 +1,7 @@
 package io.astradb.raft.election;
 
 import io.astradb.raft.log.RaftLogStore;
+import io.astradb.raft.rpc.ElectionTimeoutResetter;
 import io.astradb.raft.rpc.RequestVoteRequest;
 import io.astradb.raft.rpc.RequestVoteResponse;
 import io.astradb.raft.state.RaftNodeState;
@@ -13,7 +14,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 /** Coordinates Raft leader elections and collects votes from peers. */
-public final class RaftElectionCoordinator implements AutoCloseable {
+public final class RaftElectionCoordinator implements AutoCloseable, ElectionTimeoutResetter {
 
   private final String localNodeId;
   private final Set<String> peerIds;
@@ -274,6 +275,20 @@ public final class RaftElectionCoordinator implements AutoCloseable {
     started = false;
     activeElection = null;
     cancelElectionTimeout();
+  }
+
+  /** Resets the election timeout after receiving valid leader communication. */
+  @Override
+  public synchronized void resetElectionTimeout() {
+    if (!started || closed || nodeState.getRole() == RaftRole.LEADER) {
+      return;
+    }
+
+    // Invalidate any election that was active before leader communication.
+    activeElection = null;
+
+    // Cancel the previous timeout and schedule a fresh randomized timeout.
+    scheduleElectionTimeout();
   }
 
   /**
