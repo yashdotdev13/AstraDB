@@ -40,6 +40,7 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
@@ -155,6 +156,82 @@ class ThreeNodeRaftIntegrationTests {
     assertEquals(1, node3.commitIndex.getCommitIndex());
   }
 
+  @Test
+  void shouldRecoverUnavailableFollowerAndReplicateMissingEntries() throws Exception {
+
+    // Make node-3 unavailable before the election.
+    node3.setUnavailable(true);
+
+    // Node-1 should still become leader with votes from itself and node-2.
+    node1.electionCoordinator.startElection();
+
+    assertTrue(
+        leaderElected.await(5, TimeUnit.SECONDS),
+        "Node-1 should become leader with a majority despite node-3 being unavailable");
+
+    assertEquals(RaftRole.LEADER, node1.nodeState.getRole());
+
+    // Start replication while node-3 is unavailable.
+    heartbeatManager.start();
+
+    List<RaftLogEntry> entries =
+        List.of(
+            new RaftLogEntry(1, 1, "CREATE TABLE users".getBytes(StandardCharsets.UTF_8)),
+            new RaftLogEntry(2, 1, "CREATE TABLE orders".getBytes(StandardCharsets.UTF_8)),
+            new RaftLogEntry(3, 1, "CREATE INDEX users_id".getBytes(StandardCharsets.UTF_8)));
+
+    node1.logStore.appendAll(entries);
+
+    // First replication round: node-2 succeeds, node-3 returns HTTP 503.
+    heartbeatManager.sendHeartbeats();
+
+    assertTrue(
+        awaitCondition(
+            () ->
+                node2.logStore.getLastLogIndex() == 3
+                    && node1.commitIndex.getCommitIndex() == 3
+                    && node3.unavailableAppendEntriesCount.get() > 0),
+        "Node-2 should replicate the entries and the leader should commit them");
+
+    assertEquals(0, node3.logStore.getLastLogIndex());
+
+    // Restore node-3 without changing its HTTP address.
+    node3.setUnavailable(false);
+
+    // Retry replication. Node-3 should receive all three missing entries.
+    heartbeatManager.sendHeartbeats();
+
+    assertTrue(
+        awaitCondition(
+            () -> node3.logStore.getLastLogIndex() == 3 && node3.commitIndex.getCommitIndex() == 3),
+        "Node-3 should catch up and receive the leader's committed index");
+
+    // Verify every replicated entry.
+    for (int i = 0; i < entries.size(); i++) {
+      RaftLogEntry expected = entries.get(i);
+
+      RaftLogEntry actual = node3.logStore.getEntry(expected.getIndex()).orElseThrow();
+
+      assertEquals(expected.getIndex(), actual.getIndex());
+      assertEquals(expected.getTerm(), actual.getTerm());
+      assertArrayEquals(expected.getPayload(), actual.getPayload());
+    }
+
+    // Node-2 received the entries before the leader committed them.
+    // Send another heartbeat to propagate the updated commit index.
+    heartbeatManager.sendHeartbeats();
+
+    assertTrue(
+        awaitCondition(
+            () ->
+                node2.commitIndex.getCommitIndex() == 3 && node3.commitIndex.getCommitIndex() == 3),
+        "The committed index should eventually reach both followers");
+
+    assertEquals(3, node1.commitIndex.getCommitIndex());
+    assertEquals(3, node2.commitIndex.getCommitIndex());
+    assertEquals(3, node3.commitIndex.getCommitIndex());
+  }
+
   private boolean awaitCondition(BooleanSupplier condition) {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 
@@ -239,9 +316,16 @@ class ThreeNodeRaftIntegrationTests {
     private RaftElectionCoordinator electionCoordinator;
     private RequestVoteHandler requestVoteHandler;
     private AppendEntriesHandler appendEntriesHandler;
+    private volatile boolean unavailable;
+
+    private final AtomicInteger unavailableAppendEntriesCount = new AtomicInteger();
 
     private Node(String nodeId) {
       this.nodeId = nodeId;
+    }
+
+    private void setUnavailable(boolean unavailable) {
+      this.unavailable = unavailable;
     }
 
     private void startServer() throws IOException {
@@ -261,6 +345,10 @@ class ThreeNodeRaftIntegrationTests {
 
     private void handleRequestVote(HttpExchange exchange) throws IOException {
       try (exchange) {
+        if (unavailable) {
+          sendUnavailable(exchange);
+          return;
+        }
         RequestVoteRpcRequest request =
             OBJECT_MAPPER.readValue(exchange.getRequestBody(), RequestVoteRpcRequest.class);
 
@@ -280,6 +368,11 @@ class ThreeNodeRaftIntegrationTests {
 
     private void handleAppendEntries(HttpExchange exchange) throws IOException {
       try (exchange) {
+        if (unavailable) {
+          unavailableAppendEntriesCount.incrementAndGet();
+          sendUnavailable(exchange);
+          return;
+        }
         AppendEntriesRpcRequest request =
             OBJECT_MAPPER.readValue(exchange.getRequestBody(), AppendEntriesRpcRequest.class);
 
@@ -315,6 +408,13 @@ class ThreeNodeRaftIntegrationTests {
 
       exchange.getResponseHeaders().set("Content-Type", "application/json");
       exchange.sendResponseHeaders(200, body.length);
+      exchange.getResponseBody().write(body);
+    }
+
+    private void sendUnavailable(HttpExchange exchange) throws IOException {
+      byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+
+      exchange.sendResponseHeaders(503, body.length);
       exchange.getResponseBody().write(body);
     }
 
