@@ -6,6 +6,8 @@ import io.astradb.raft.election.RaftElectionCoordinator;
 import io.astradb.raft.election.RaftHeartbeatManager;
 import io.astradb.raft.election.RaftPeerClient;
 import io.astradb.raft.log.RocksDbRaftLogStore;
+import io.astradb.raft.rpc.AppendEntriesHandler;
+import io.astradb.raft.rpc.RequestVoteHandler;
 import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import io.astradb.raft.state.RaftRole;
@@ -124,5 +126,23 @@ public class RaftConsensusConfiguration {
             raftHeartbeatManager.stop();
           }
         });
+  }
+
+  @Bean
+  public RequestVoteHandler requestVoteHandler(
+      RaftNodeState raftNodeState, RocksDbRaftLogStore raftLogStore) {
+
+    return new RequestVoteHandler(raftNodeState, raftLogStore);
+  }
+
+  @Bean
+  public AppendEntriesHandler appendEntriesHandler(
+      RaftNodeState raftNodeState,
+      RocksDbRaftLogStore raftLogStore,
+      RaftElectionCoordinator raftElectionCoordinator,
+      RaftCommitIndex raftCommitIndex) {
+
+    return new AppendEntriesHandler(
+        raftNodeState, raftLogStore, raftElectionCoordinator, raftCommitIndex);
   }
 }
