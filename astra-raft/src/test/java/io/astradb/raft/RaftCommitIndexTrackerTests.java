@@ -8,6 +8,7 @@ import io.astradb.raft.log.RaftLogEntry;
 import io.astradb.raft.log.RaftLogStore;
 import io.astradb.raft.metadata.RaftMetadata;
 import io.astradb.raft.metadata.RaftMetadataStore;
+import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import java.util.ArrayList;
 import java.util.List;
@@ -107,6 +108,21 @@ class RaftCommitIndexTrackerTests {
     assertThrows(NullPointerException.class, () -> new RaftCommitIndexTracker(null, logStore, 3));
 
     assertThrows(NullPointerException.class, () -> new RaftCommitIndexTracker(nodeState, null, 3));
+  }
+
+  @Test
+  void shouldUpdateSharedCommitIndex() {
+    RaftCommitIndex sharedCommitIndex = new RaftCommitIndex();
+
+    RaftCommitIndexTracker sharedTracker =
+        new RaftCommitIndexTracker(nodeState, logStore, 3, sharedCommitIndex);
+
+    appendEntries(1, 1, 1, 1, 1);
+
+    sharedTracker.advanceCommitIndex(List.of(5L, 4L, 2L));
+
+    assertEquals(4, sharedCommitIndex.getCommitIndex());
+    assertEquals(4, sharedTracker.getCommitIndex());
   }
 
   private void appendEntries(long... terms) {

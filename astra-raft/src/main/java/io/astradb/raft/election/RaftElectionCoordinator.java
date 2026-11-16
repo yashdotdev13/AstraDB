@@ -12,6 +12,7 @@ import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Consumer;
 
 /** Coordinates Raft leader elections and collects votes from peers. */
 public final class RaftElectionCoordinator implements AutoCloseable, ElectionTimeoutResetter {
@@ -23,6 +24,7 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
   private final RaftPeerClient peerClient;
   private final ElectionTimeout electionTimeout;
   private final ScheduledExecutorService scheduler;
+  private final Consumer<RaftRole> roleChangeListener;
 
   private ElectionContext activeElection;
   private ScheduledFuture<?> electionTimeoutTask;
@@ -38,7 +40,7 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
       RaftLogStore logStore,
       RaftPeerClient peerClient) {
 
-    this(localNodeId, peerIds, nodeState, logStore, peerClient, null, null);
+    this(localNodeId, peerIds, nodeState, logStore, peerClient, null, null, null);
   }
 
   /** Creates a coordinator with automatic election timeout scheduling. */
@@ -50,6 +52,25 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
       RaftPeerClient peerClient,
       ElectionTimeout electionTimeout,
       ScheduledExecutorService scheduler) {
+
+    this(localNodeId, peerIds, nodeState, logStore, peerClient, electionTimeout, scheduler, null);
+  }
+
+  /**
+   * Creates a coordinator with automatic election timeout scheduling and a role-change listener.
+   *
+   * <p>The listener is notified when this coordinator successfully elects the node as leader or
+   * when a higher-term vote response causes the node to step down.
+   */
+  public RaftElectionCoordinator(
+      String localNodeId,
+      Set<String> peerIds,
+      RaftNodeState nodeState,
+      RaftLogStore logStore,
+      RaftPeerClient peerClient,
+      ElectionTimeout electionTimeout,
+      ScheduledExecutorService scheduler,
+      Consumer<RaftRole> roleChangeListener) {
 
     this.localNodeId = Objects.requireNonNull(localNodeId, "Local node ID must not be null");
 
@@ -80,6 +101,7 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
 
     this.electionTimeout = electionTimeout;
     this.scheduler = scheduler;
+    this.roleChangeListener = roleChangeListener;
   }
 
   /**
@@ -131,6 +153,7 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
       if (nodeState.becomeLeader(electionTerm)) {
         activeElection = null;
         cancelElectionTimeout();
+        notifyRoleChange(RaftRole.LEADER);
       }
       return electionTerm;
     }
@@ -177,7 +200,14 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
 
     // A higher-term response requires an immediate step-down.
     if (response.getTerm() > nodeState.getCurrentTerm()) {
+      RaftRole previousRole = nodeState.getRole();
+
       nodeState.advanceTermIfHigher(response.getTerm());
+
+      if (previousRole != nodeState.getRole()) {
+        notifyRoleChange(nodeState.getRole());
+      }
+
       finishElectionAndReschedule(context);
       return;
     }
@@ -199,9 +229,17 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
       if (nodeState.becomeLeader(context.term)) {
         activeElection = null;
         cancelElectionTimeout();
+        notifyRoleChange(RaftRole.LEADER);
       }
     } else if (context.voteCounter.isMajorityImpossible()) {
       finishElectionAndReschedule(context);
+    }
+  }
+
+  /** Notifies the optional listener when the node's role changes. */
+  private void notifyRoleChange(RaftRole role) {
+    if (roleChangeListener != null) {
+      roleChangeListener.accept(role);
     }
   }
 
