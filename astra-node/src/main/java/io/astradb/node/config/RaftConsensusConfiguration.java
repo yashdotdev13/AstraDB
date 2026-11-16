@@ -48,12 +48,25 @@ public class RaftConsensusConfiguration {
         .collect(Collectors.toUnmodifiableSet());
   }
 
-  /** Configures the HTTP addresses associated with Raft peer identifiers. */
+  /** Configures and validates HTTP addresses for all configured Raft peers. */
   @Bean
   public RaftPeerAddressProvider raftPeerAddressProvider(
-      @Value("${astra.raft.peer-addresses:}") String configuredAddresses) {
+      @Value("${astra.raft.peer-addresses:}") String configuredAddresses,
+      @Value("${astra.raft.node-id:node-1}") String localNodeId,
+      Set<String> raftPeerIds) {
 
-    return new RaftPeerAddressProvider(configuredAddresses);
+    if (raftPeerIds.contains(localNodeId)) {
+      throw new IllegalArgumentException(
+          "Local node ID must not be included in the Raft peer list: " + localNodeId);
+    }
+
+    RaftPeerAddressProvider provider = new RaftPeerAddressProvider(configuredAddresses);
+
+    for (String peerId : raftPeerIds) {
+      provider.getAddress(peerId);
+    }
+
+    return provider;
   }
 
   /** Creates the HTTP client used for inter-node Raft communication. */
