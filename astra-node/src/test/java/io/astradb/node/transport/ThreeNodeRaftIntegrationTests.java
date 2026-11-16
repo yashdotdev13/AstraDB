@@ -1,8 +1,6 @@
 package io.astradb.node.transport;
 
-import static org.junit.jupiter.api.Assertions.assertArrayEquals;
-import static org.junit.jupiter.api.Assertions.assertEquals;
-import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.*;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.sun.net.httpserver.HttpExchange;
@@ -29,6 +27,8 @@ import io.astradb.raft.state.RaftRole;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
@@ -232,6 +232,144 @@ class ThreeNodeRaftIntegrationTests {
     assertEquals(3, node3.commitIndex.getCommitIndex());
   }
 
+  @Test
+  void shouldRecoverConflictingFollowerLogOverHttp() throws Exception {
+
+    // Move node-1 to term 1 before starting its election.
+    node1.nodeState.advanceTermIfHigher(1);
+
+    // Leader log: 1/T1, 2/T1, 3/T2.
+    node1.logStore.appendAll(
+        List.of(
+            new RaftLogEntry(1, 1, "entry-1".getBytes(StandardCharsets.UTF_8)),
+            new RaftLogEntry(2, 1, "leader-entry-2".getBytes(StandardCharsets.UTF_8)),
+            new RaftLogEntry(3, 2, "leader-entry-3".getBytes(StandardCharsets.UTF_8))));
+
+    // Node-3 has a conflicting, uncommitted suffix: 1/T1, 2/T2.
+    node3.logStore.appendAll(
+        List.of(
+            new RaftLogEntry(1, 1, "entry-1".getBytes(StandardCharsets.UTF_8)),
+            new RaftLogEntry(2, 2, "conflicting-entry-2".getBytes(StandardCharsets.UTF_8))));
+
+    // Elect node-1. Its log is more up-to-date than node-3's log.
+    node1.electionCoordinator.startElection();
+
+    assertTrue(leaderElected.await(5, TimeUnit.SECONDS), "Node-1 should become leader in term 2");
+
+    assertEquals(2, node1.nodeState.getCurrentTerm());
+    assertEquals(RaftRole.LEADER, node1.nodeState.getRole());
+
+    // Use a short interval so rejected requests are retried automatically.
+    heartbeatManager.close();
+
+    heartbeatManager =
+        new RaftHeartbeatManager(
+            node1.nodeId,
+            Set.of("node-2", "node-3"),
+            node1.nodeState,
+            node1.logStore,
+            node1.peerClient,
+            node1.scheduler,
+            10,
+            node1.commitIndex);
+
+    heartbeatManager.start();
+
+    // Wait until node-3 rejects inconsistent entries, accepts the corrected
+    // suffix, and receives the leader's committed index.
+    assertTrue(
+        awaitCondition(
+            () ->
+                node3.failedAppendEntriesCount.get() >= 2
+                    && node3.successfulAppendEntriesCount.get() >= 1
+                    && node3.logStore.getLastLogIndex() == 3
+                    && node3.commitIndex.getCommitIndex() == 3),
+        "Node-3 should reject conflicting entries, recover its log, and commit the entries");
+
+    // Verify that the conflicting suffix was replaced.
+    assertEquals(3, node3.logStore.getLastLogIndex());
+
+    assertArrayEquals(
+        "entry-1".getBytes(StandardCharsets.UTF_8),
+        node3.logStore.getEntry(1).orElseThrow().getPayload());
+
+    assertArrayEquals(
+        "leader-entry-2".getBytes(StandardCharsets.UTF_8),
+        node3.logStore.getEntry(2).orElseThrow().getPayload());
+
+    assertArrayEquals(
+        "leader-entry-3".getBytes(StandardCharsets.UTF_8),
+        node3.logStore.getEntry(3).orElseThrow().getPayload());
+
+    assertEquals(1, node3.logStore.getEntry(2).orElseThrow().getTerm());
+    assertEquals(2, node3.logStore.getEntry(3).orElseThrow().getTerm());
+
+    // Verify that node-2 also converges with the leader.
+    assertTrue(
+        awaitCondition(
+            () -> node2.logStore.getLastLogIndex() == 3 && node2.commitIndex.getCommitIndex() == 3),
+        "Node-2 should also replicate and commit all entries");
+
+    assertEquals(3, node1.commitIndex.getCommitIndex());
+    assertEquals(3, node2.commitIndex.getCommitIndex());
+    assertEquals(3, node3.commitIndex.getCommitIndex());
+  }
+
+  @Test
+  void shouldRejectConflictingEntryAtCommittedIndexOverHttp() throws Exception {
+
+    // Give node-3 an existing log and commit its second entry.
+    node3.logStore.appendAll(
+        List.of(
+            new RaftLogEntry(1, 1, "entry-1".getBytes(StandardCharsets.UTF_8)),
+            new RaftLogEntry(2, 1, "committed-entry-2".getBytes(StandardCharsets.UTF_8))));
+
+    node3.commitIndex.advanceTo(2);
+
+    // Send a conflicting entry at the already committed index.
+    AppendEntriesRequest conflictingRequest =
+        new AppendEntriesRequest(
+            1,
+            "node-1",
+            1,
+            1,
+            List.of(new RaftLogEntry(2, 2, "conflicting-entry-2".getBytes(StandardCharsets.UTF_8))),
+            2);
+
+    AppendEntriesRpcRequest rpcRequest = AppendEntriesRpcRequest.from(conflictingRequest);
+
+    HttpClient client = HttpClient.newHttpClient();
+
+    String url = node3.baseAddress() + "/internal/raft/append-entries";
+
+    HttpRequest httpRequest =
+        HttpRequest.newBuilder()
+            .uri(java.net.URI.create(url))
+            .header("Content-Type", "application/json")
+            .POST(
+                HttpRequest.BodyPublishers.ofByteArray(OBJECT_MAPPER.writeValueAsBytes(rpcRequest)))
+            .build();
+
+    HttpResponse<String> response = client.send(httpRequest, HttpResponse.BodyHandlers.ofString());
+
+    assertEquals(200, response.statusCode());
+
+    AppendEntriesRpcResponse rpcResponse =
+        OBJECT_MAPPER.readValue(response.body(), AppendEntriesRpcResponse.class);
+
+    assertFalse(rpcResponse.success());
+
+    // The committed entry must remain unchanged.
+    assertEquals(2, node3.commitIndex.getCommitIndex());
+    assertEquals(2, node3.logStore.getLastLogIndex());
+
+    RaftLogEntry retainedEntry = node3.logStore.getEntry(2).orElseThrow();
+
+    assertEquals(1, retainedEntry.getTerm());
+    assertArrayEquals(
+        "committed-entry-2".getBytes(StandardCharsets.UTF_8), retainedEntry.getPayload());
+  }
+
   private boolean awaitCondition(BooleanSupplier condition) {
     long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
 
@@ -320,6 +458,10 @@ class ThreeNodeRaftIntegrationTests {
 
     private final AtomicInteger unavailableAppendEntriesCount = new AtomicInteger();
 
+    private final AtomicInteger successfulAppendEntriesCount = new AtomicInteger();
+
+    private final AtomicInteger failedAppendEntriesCount = new AtomicInteger();
+
     private Node(String nodeId) {
       this.nodeId = nodeId;
     }
@@ -349,6 +491,7 @@ class ThreeNodeRaftIntegrationTests {
           sendUnavailable(exchange);
           return;
         }
+
         RequestVoteRpcRequest request =
             OBJECT_MAPPER.readValue(exchange.getRequestBody(), RequestVoteRpcRequest.class);
 
@@ -390,6 +533,19 @@ class ThreeNodeRaftIntegrationTests {
         AppendEntriesRpcResponse response = AppendEntriesRpcResponse.from(raftResponse);
 
         sendJson(exchange, response);
+
+        if (raftResponse.isSuccess()) {
+          successfulAppendEntriesCount.incrementAndGet();
+        } else {
+          failedAppendEntriesCount.incrementAndGet();
+        }
+
+        // Track successful and rejected AppendEntries responses.
+        if (raftResponse.isSuccess()) {
+          successfulAppendEntriesCount.incrementAndGet();
+        } else {
+          failedAppendEntriesCount.incrementAndGet();
+        }
 
         if (raftResponse.isSuccess()) {
           if (nodeId.equals("node-2") || nodeId.equals("node-3")) {
