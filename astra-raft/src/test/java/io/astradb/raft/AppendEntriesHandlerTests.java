@@ -184,10 +184,64 @@ class AppendEntriesHandlerTests {
     assertEquals("two", payloadAt(2));
   }
 
+  @Test
+  void shouldAdvanceCommitIndexFromLeaderCommit() {
+    logStore.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two")));
+
+    AppendEntriesResponse response = handler.handle(request(1, 0, 0, List.of(), 2));
+
+    assertTrue(response.isSuccess());
+    assertEquals(2, handler.getCommitIndex());
+  }
+
+  @Test
+  void shouldNotAdvanceCommitIndexBeyondLocalLog() {
+    logStore.append(entry(1, 1, "one"));
+
+    AppendEntriesResponse response = handler.handle(request(1, 0, 0, List.of(), 5));
+
+    assertTrue(response.isSuccess());
+    assertEquals(1, handler.getCommitIndex());
+  }
+
+  @Test
+  void shouldNeverMoveCommitIndexBackwards() {
+    logStore.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two")));
+
+    handler.handle(request(1, 0, 0, List.of(), 2));
+    handler.handle(request(1, 0, 0, List.of(), 1));
+
+    assertEquals(2, handler.getCommitIndex());
+  }
+
+  @Test
+  void shouldRejectConflictingEntryAtCommittedIndex() {
+    logStore.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "old-two")));
+
+    handler.handle(request(1, 0, 0, List.of(), 2));
+
+    AppendEntriesResponse response =
+        handler.handle(request(1, 1, 1, List.of(entry(2, 2, "new-two")), 2));
+
+    assertFalse(response.isSuccess());
+    assertEquals(2, handler.getCommitIndex());
+    assertEquals("old-two", payloadAt(2));
+  }
+
   private AppendEntriesRequest request(
       long term, long previousIndex, long previousTerm, List<RaftLogEntry> entries) {
+    return request(term, previousIndex, previousTerm, entries, 0);
+  }
 
-    return new AppendEntriesRequest(term, "leader-1", previousIndex, previousTerm, entries, 0);
+  private AppendEntriesRequest request(
+      long term,
+      long previousIndex,
+      long previousTerm,
+      List<RaftLogEntry> entries,
+      long leaderCommit) {
+
+    return new AppendEntriesRequest(
+        term, "leader-1", previousIndex, previousTerm, entries, leaderCommit);
   }
 
   private RaftLogEntry entry(long index, long term, String payload) {

@@ -1,16 +1,28 @@
+
 spring:
   application:
     name: astra-node
 
 server:
-  port: 8080
+  port: 8081
 
 management:
   endpoints:
     web:
       exposure:
         include: health,info,metrics
-
   endpoint:
     health:
       show-details: always
+
+astra:
+  raft:
+    node-id: node-1
+    peers: ""
+    storage-path: ./data/raft
+
+    election:
+      minimum-timeout-ms: 300
+      maximum-timeout-ms: 600
+
+    heartbeat-interval-ms: 50

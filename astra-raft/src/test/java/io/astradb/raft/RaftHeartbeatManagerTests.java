@@ -343,6 +343,45 @@ class RaftHeartbeatManagerTests {
     assertTrue(retry.getEntries().isEmpty());
   }
 
+  @Test
+  void shouldPropagateCommitIndexAfterMajorityReplication() {
+    logStore.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 1, "three")));
+
+    heartbeatManager.start();
+    scheduler.runNextTask();
+
+    // Leader + node-2 form a majority in this three-node cluster.
+    peerClient.respond("node-2", 1, true);
+
+    scheduler.runNextTask();
+
+    AppendEntriesRequest node2Request = peerClient.requests.get("node-2").request;
+    AppendEntriesRequest node3Request = peerClient.requests.get("node-3").request;
+
+    assertEquals(3, node2Request.getLeaderCommit());
+    assertEquals(3, node3Request.getLeaderCommit());
+  }
+
+  @Test
+  void shouldNotPropagateCommitIndexForEntriesFromOlderTerms() {
+    nodeState.startElection("node-1");
+    nodeState.becomeLeader();
+
+    logStore.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 1, "three")));
+
+    heartbeatManager.start();
+    scheduler.runNextTask();
+
+    // The leader is now in term 2, but these entries belong to term 1.
+    peerClient.respond("node-2", 2, true);
+
+    scheduler.runNextTask();
+
+    AppendEntriesRequest request = peerClient.requests.get("node-2").request;
+
+    assertEquals(0, request.getLeaderCommit());
+  }
+
   private void becomeLeader() {
     nodeState.startElection("node-1");
     nodeState.becomeLeader();

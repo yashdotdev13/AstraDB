@@ -4,12 +4,16 @@ import io.astradb.raft.log.RaftLogEntry;
 import io.astradb.raft.log.RaftLogStore;
 import io.astradb.raft.rpc.AppendEntriesRequest;
 import io.astradb.raft.rpc.AppendEntriesResponse;
+import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import io.astradb.raft.state.RaftRole;
+import io.astradb.raft.state.RaftStateMachineApplier;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
@@ -25,6 +29,8 @@ public final class RaftHeartbeatManager implements AutoCloseable {
   private final RaftPeerClient peerClient;
   private final ScheduledExecutorService scheduler;
   private final long heartbeatIntervalMillis;
+  private final RaftCommitIndexTracker commitIndexTracker;
+  private final Optional<RaftStateMachineApplier> stateMachineApplier;
 
   private final Map<String, RaftPeerReplicationState> replicationStates = new HashMap<>();
 
@@ -32,6 +38,12 @@ public final class RaftHeartbeatManager implements AutoCloseable {
   private boolean started;
   private boolean closed;
 
+  /**
+   * Creates a heartbeat manager with a new local commit-index instance.
+   *
+   * <p>Use a constructor accepting a shared RaftCommitIndex when other components on this node need
+   * to observe the same commit index.
+   */
   public RaftHeartbeatManager(
       String localNodeId,
       Set<String> peerIds,
@@ -40,6 +52,80 @@ public final class RaftHeartbeatManager implements AutoCloseable {
       RaftPeerClient peerClient,
       ScheduledExecutorService scheduler,
       long heartbeatIntervalMillis) {
+
+    this(
+        localNodeId,
+        peerIds,
+        nodeState,
+        logStore,
+        peerClient,
+        scheduler,
+        heartbeatIntervalMillis,
+        new RaftCommitIndex());
+  }
+
+  /** Creates a heartbeat manager using the supplied shared commit index. */
+  public RaftHeartbeatManager(
+      String localNodeId,
+      Set<String> peerIds,
+      RaftNodeState nodeState,
+      RaftLogStore logStore,
+      RaftPeerClient peerClient,
+      ScheduledExecutorService scheduler,
+      long heartbeatIntervalMillis,
+      RaftCommitIndex commitIndex) {
+
+    this(
+        localNodeId,
+        peerIds,
+        nodeState,
+        logStore,
+        peerClient,
+        scheduler,
+        heartbeatIntervalMillis,
+        commitIndex,
+        Optional.empty());
+  }
+
+  /**
+   * Creates a heartbeat manager with shared commit-index and state-machine application.
+   *
+   * <p>The supplied applier must use the exact same commit-index instance.
+   */
+  public RaftHeartbeatManager(
+      String localNodeId,
+      Set<String> peerIds,
+      RaftNodeState nodeState,
+      RaftLogStore logStore,
+      RaftPeerClient peerClient,
+      ScheduledExecutorService scheduler,
+      long heartbeatIntervalMillis,
+      RaftCommitIndex commitIndex,
+      RaftStateMachineApplier stateMachineApplier) {
+
+    this(
+        localNodeId,
+        peerIds,
+        nodeState,
+        logStore,
+        peerClient,
+        scheduler,
+        heartbeatIntervalMillis,
+        commitIndex,
+        Optional.of(
+            Objects.requireNonNull(stateMachineApplier, "State machine applier must not be null")));
+  }
+
+  private RaftHeartbeatManager(
+      String localNodeId,
+      Set<String> peerIds,
+      RaftNodeState nodeState,
+      RaftLogStore logStore,
+      RaftPeerClient peerClient,
+      ScheduledExecutorService scheduler,
+      long heartbeatIntervalMillis,
+      RaftCommitIndex commitIndex,
+      Optional<RaftStateMachineApplier> stateMachineApplier) {
 
     this.localNodeId = Objects.requireNonNull(localNodeId, "Local node ID must not be null");
 
@@ -69,6 +155,24 @@ public final class RaftHeartbeatManager implements AutoCloseable {
     }
 
     this.heartbeatIntervalMillis = heartbeatIntervalMillis;
+
+    RaftCommitIndex sharedCommitIndex =
+        Objects.requireNonNull(commitIndex, "Commit index must not be null");
+
+    this.stateMachineApplier =
+        Objects.requireNonNull(stateMachineApplier, "State machine applier must not be null");
+
+    this.stateMachineApplier.ifPresent(
+        applier -> {
+          if (applier.getCommitIndex() != sharedCommitIndex) {
+            throw new IllegalArgumentException(
+                "State machine applier must use the same commit index");
+          }
+        });
+
+    this.commitIndexTracker =
+        new RaftCommitIndexTracker(
+            this.nodeState, this.logStore, this.peerIds.size() + 1, sharedCommitIndex);
   }
 
   /** Starts periodic AppendEntries transmission. The node must already be a leader. */
@@ -147,7 +251,13 @@ public final class RaftHeartbeatManager implements AutoCloseable {
         entries.isEmpty() ? previousLogIndex : entries.get(entries.size() - 1).getIndex();
 
     AppendEntriesRequest request =
-        new AppendEntriesRequest(term, localNodeId, previousLogIndex, previousLogTerm, entries, 0);
+        new AppendEntriesRequest(
+            term,
+            localNodeId,
+            previousLogIndex,
+            previousLogTerm,
+            entries,
+            commitIndexTracker.getCommitIndex());
 
     peerClient
         .appendEntries(peerId, request)
@@ -174,7 +284,7 @@ public final class RaftHeartbeatManager implements AutoCloseable {
       return;
     }
 
-    if (requestTerm != nodeState.getCurrentTerm()) {
+    if (requestTerm != nodeState.getCurrentTerm() || nodeState.getRole() != RaftRole.LEADER) {
       return;
     }
 
@@ -186,24 +296,26 @@ public final class RaftHeartbeatManager implements AutoCloseable {
 
     if (response.isSuccess()) {
       replicationState.recordSuccess(replicatedThroughIndex);
+      advanceCommitIndex();
     } else {
       replicationState.recordFailure(attemptedNextIndex);
     }
   }
 
-  private synchronized void scheduleNextHeartbeat() {
-    if (!started || closed || nodeState.getRole() != RaftRole.LEADER) {
-      stopScheduling();
-      return;
+  private synchronized void advanceCommitIndex() {
+    List<Long> replicatedIndexes = new ArrayList<>();
+
+    // The leader always counts its own log as replicated.
+    replicatedIndexes.add(logStore.getLastLogIndex());
+
+    for (RaftPeerReplicationState state : replicationStates.values()) {
+      replicatedIndexes.add(state.getMatchIndex());
     }
 
-    if (heartbeatTask != null) {
-      heartbeatTask.cancel(false);
-    }
+    commitIndexTracker.advanceCommitIndex(replicatedIndexes);
 
-    heartbeatTask =
-        scheduler.schedule(
-            this::runScheduledHeartbeat, heartbeatIntervalMillis, TimeUnit.MILLISECONDS);
+    // Apply any entries that have become committed.
+    stateMachineApplier.ifPresent(RaftStateMachineApplier::applyCommittedEntries);
   }
 
   private void runScheduledHeartbeat() {
@@ -221,6 +333,21 @@ public final class RaftHeartbeatManager implements AutoCloseable {
     synchronized (this) {
       scheduleNextHeartbeat();
     }
+  }
+
+  private synchronized void scheduleNextHeartbeat() {
+    if (!started || closed || nodeState.getRole() != RaftRole.LEADER) {
+      stopScheduling();
+      return;
+    }
+
+    if (heartbeatTask != null) {
+      heartbeatTask.cancel(false);
+    }
+
+    heartbeatTask =
+        scheduler.schedule(
+            this::runScheduledHeartbeat, heartbeatIntervalMillis, TimeUnit.MILLISECONDS);
   }
 
   private synchronized void stopScheduling() {

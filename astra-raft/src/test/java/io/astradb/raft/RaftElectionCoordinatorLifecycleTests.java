@@ -28,6 +28,7 @@ import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -220,6 +221,88 @@ class RaftElectionCoordinatorLifecycleTests {
 
     assertEquals(2, nodeState.getCurrentTerm());
     assertEquals(RaftRole.CANDIDATE, nodeState.getRole());
+  }
+
+  @Test
+  void shouldNotifyWhenNodeBecomesLeader() {
+    AtomicReference<RaftRole> notifiedRole = new AtomicReference<>();
+
+    RaftElectionCoordinator listenerCoordinator =
+        new RaftElectionCoordinator(
+            "node-1",
+            Set.of("node-2", "node-3", "node-4", "node-5"),
+            nodeState,
+            logStore,
+            peerClient,
+            new ElectionTimeout(new RaftElectionConfig(150, 300), new FixedRandomGenerator()),
+            scheduler,
+            notifiedRole::set);
+
+    listenerCoordinator.start();
+    scheduler.runNextTask();
+
+    // One peer vote is not enough to reach the majority.
+    peerClient.respond("node-2", 1, true);
+
+    assertNull(notifiedRole.get());
+    assertEquals(RaftRole.CANDIDATE, nodeState.getRole());
+
+    // Self vote + two peer votes = majority of five nodes.
+    peerClient.respond("node-3", 1, true);
+
+    assertEquals(RaftRole.LEADER, notifiedRole.get());
+    assertEquals(RaftRole.LEADER, nodeState.getRole());
+    assertEquals(0, scheduler.getScheduledTaskCount());
+  }
+
+  @Test
+  void shouldNotifyWhenNodeStepsDownAfterHigherTermResponse() {
+    AtomicReference<RaftRole> notifiedRole = new AtomicReference<>();
+
+    RaftElectionCoordinator listenerCoordinator =
+        new RaftElectionCoordinator(
+            "node-1",
+            Set.of("node-2", "node-3", "node-4", "node-5"),
+            nodeState,
+            logStore,
+            peerClient,
+            new ElectionTimeout(new RaftElectionConfig(150, 300), new FixedRandomGenerator()),
+            scheduler,
+            notifiedRole::set);
+
+    listenerCoordinator.start();
+    scheduler.runNextTask();
+
+    peerClient.respond("node-2", 2, false);
+
+    assertEquals(RaftRole.FOLLOWER, notifiedRole.get());
+    assertEquals(RaftRole.FOLLOWER, nodeState.getRole());
+    assertEquals(2, nodeState.getCurrentTerm());
+  }
+
+  @Test
+  void shouldNotifyWhenSingleNodeClusterBecomesLeader() {
+    AtomicReference<RaftRole> notifiedRole = new AtomicReference<>();
+
+    RaftElectionCoordinator singleNodeCoordinator =
+        new RaftElectionCoordinator(
+            "node-1",
+            Set.of(),
+            nodeState,
+            logStore,
+            peerClient,
+            new ElectionTimeout(new RaftElectionConfig(150, 300), new FixedRandomGenerator()),
+            scheduler,
+            notifiedRole::set);
+
+    singleNodeCoordinator.start();
+
+    scheduler.runNextTask();
+
+    assertEquals(RaftRole.LEADER, notifiedRole.get());
+    assertEquals(RaftRole.LEADER, nodeState.getRole());
+    assertEquals(1, nodeState.getCurrentTerm());
+    assertEquals(0, scheduler.getScheduledTaskCount());
   }
 
   private static final class FixedRandomGenerator implements java.util.random.RandomGenerator {
