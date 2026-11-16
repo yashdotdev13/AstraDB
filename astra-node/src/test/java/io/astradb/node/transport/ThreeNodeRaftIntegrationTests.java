@@ -1,5 +1,6 @@
 package io.astradb.node.transport;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -20,6 +21,7 @@ import io.astradb.raft.log.RaftLogStore;
 import io.astradb.raft.metadata.RaftMetadata;
 import io.astradb.raft.metadata.RaftMetadataStore;
 import io.astradb.raft.rpc.AppendEntriesHandler;
+import io.astradb.raft.rpc.AppendEntriesRequest;
 import io.astradb.raft.rpc.RequestVoteHandler;
 import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
@@ -27,6 +29,7 @@ import io.astradb.raft.state.RaftRole;
 import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.http.HttpClient;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
@@ -38,6 +41,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BooleanSupplier;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -51,8 +55,10 @@ class ThreeNodeRaftIntegrationTests {
   private final Node node3 = new Node("node-3");
 
   private RaftHeartbeatManager heartbeatManager;
+
   private final CountDownLatch leaderElected = new CountDownLatch(1);
   private final CountDownLatch heartbeatsReceived = new CountDownLatch(2);
+  private final CountDownLatch committedHeartbeatsReceived = new CountDownLatch(2);
 
   @BeforeEach
   void setUp() throws IOException {
@@ -72,7 +78,7 @@ class ThreeNodeRaftIntegrationTests {
             node1.logStore,
             node1.peerClient,
             node1.scheduler,
-            100,
+            10_000,
             node1.commitIndex);
   }
 
@@ -88,11 +94,11 @@ class ThreeNodeRaftIntegrationTests {
   }
 
   @Test
-  void shouldElectLeaderAndSendHeartbeatsAcrossThreeHttpNodes() throws Exception {
-    // Start an election on node-1.
+  void shouldReplicateLogEntriesAndPropagateCommitIndexAcrossThreeNodes() throws Exception {
+
+    // Elect node-1 as leader.
     node1.electionCoordinator.startElection();
 
-    // Wait for actual HTTP vote responses from both followers.
     assertTrue(
         leaderElected.await(5, TimeUnit.SECONDS),
         "Node-1 should become leader after receiving majority votes");
@@ -103,19 +109,64 @@ class ThreeNodeRaftIntegrationTests {
     assertEquals(RaftRole.FOLLOWER, node2.nodeState.getRole());
     assertEquals(RaftRole.FOLLOWER, node3.nodeState.getRole());
 
-    // Start the leader heartbeat manager and send AppendEntries to both followers.
+    // Start the heartbeat manager before appending the entry.
     heartbeatManager.start();
+
+    byte[] payload = "CREATE TABLE users".getBytes(StandardCharsets.UTF_8);
+
+    node1.logStore.append(new RaftLogEntry(1, 1, payload));
+
+    // First AppendEntries round: replicate the log entry.
     heartbeatManager.sendHeartbeats();
 
     assertTrue(
         heartbeatsReceived.await(5, TimeUnit.SECONDS),
-        "Both followers should receive HTTP AppendEntries heartbeats");
+        "Both followers should receive the replicated log entry");
 
-    assertEquals(RaftRole.FOLLOWER, node2.nodeState.getRole());
-    assertEquals(RaftRole.FOLLOWER, node3.nodeState.getRole());
+    // Wait for successful HTTP responses to advance the leader's commit index.
+    assertTrue(
+        awaitCondition(() -> node1.commitIndex.getCommitIndex() == 1),
+        "Leader should commit the entry after majority replication");
 
-    assertEquals(1, node2.nodeState.getCurrentTerm());
-    assertEquals(1, node3.nodeState.getCurrentTerm());
+    // Verify that both followers have replicated the same entry.
+    for (Node follower : List.of(node2, node3)) {
+      assertEquals(1, follower.logStore.getLastLogIndex());
+
+      RaftLogEntry replicatedEntry = follower.logStore.getEntry(1).orElseThrow();
+
+      assertEquals(1, replicatedEntry.getIndex());
+      assertEquals(1, replicatedEntry.getTerm());
+      assertArrayEquals(payload, replicatedEntry.getPayload());
+
+      // The first replication round has not propagated leaderCommit yet.
+      assertEquals(0, follower.commitIndex.getCommitIndex());
+    }
+
+    // Second AppendEntries round: propagate the committed index.
+    heartbeatManager.sendHeartbeats();
+
+    assertTrue(
+        committedHeartbeatsReceived.await(5, TimeUnit.SECONDS),
+        "Both followers should receive the updated leader commit index");
+
+    // Verify commit-index propagation across all three nodes.
+    assertEquals(1, node1.commitIndex.getCommitIndex());
+    assertEquals(1, node2.commitIndex.getCommitIndex());
+    assertEquals(1, node3.commitIndex.getCommitIndex());
+  }
+
+  private boolean awaitCondition(BooleanSupplier condition) {
+    long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
+
+    while (System.nanoTime() < deadline) {
+      if (condition.getAsBoolean()) {
+        return true;
+      }
+
+      Thread.yield();
+    }
+
+    return condition.getAsBoolean();
   }
 
   private void configureNode(Node node, Set<String> peerIds) {
@@ -170,12 +221,17 @@ class ThreeNodeRaftIntegrationTests {
   private final class Node implements AutoCloseable {
 
     private final String nodeId;
+
     private final RaftNodeState nodeState = new RaftNodeState(new InMemoryMetadataStore());
+
     private final InMemoryLogStore logStore = new InMemoryLogStore();
+
     private final RaftCommitIndex commitIndex = new RaftCommitIndex();
+
     private final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(2);
 
     private final AtomicReference<RequestVoteHandler> voteHandler = new AtomicReference<>();
+
     private final AtomicReference<AppendEntriesHandler> appendHandler = new AtomicReference<>();
 
     private HttpServer server;
@@ -234,13 +290,22 @@ class ThreeNodeRaftIntegrationTests {
           return;
         }
 
-        AppendEntriesRpcResponse response =
-            AppendEntriesRpcResponse.from(handler.handle(request.toRaftRequest()));
+        AppendEntriesRequest raftRequest = request.toRaftRequest();
+
+        var raftResponse = handler.handle(raftRequest);
+
+        AppendEntriesRpcResponse response = AppendEntriesRpcResponse.from(raftResponse);
 
         sendJson(exchange, response);
 
-        if (nodeId.equals("node-2") || nodeId.equals("node-3")) {
-          heartbeatsReceived.countDown();
+        if (raftResponse.isSuccess()) {
+          if (nodeId.equals("node-2") || nodeId.equals("node-3")) {
+            heartbeatsReceived.countDown();
+
+            if (raftRequest.getLeaderCommit() >= 1) {
+              committedHeartbeatsReceived.countDown();
+            }
+          }
         }
       }
     }
@@ -254,7 +319,8 @@ class ThreeNodeRaftIntegrationTests {
     }
 
     private void sendError(HttpExchange exchange) throws IOException {
-      byte[] body = "{}".getBytes(java.nio.charset.StandardCharsets.UTF_8);
+      byte[] body = "{}".getBytes(StandardCharsets.UTF_8);
+
       exchange.sendResponseHeaders(500, body.length);
       exchange.getResponseBody().write(body);
     }
