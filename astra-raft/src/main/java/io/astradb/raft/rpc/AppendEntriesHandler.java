@@ -118,15 +118,21 @@ public final class AppendEntriesHandler {
       return false;
     }
 
-    Optional<RaftLogEntry> previousEntry = logStore.getEntry(previousIndex);
+    Optional<Long> previousTerm = logStore.getTerm(previousIndex);
 
-    return previousEntry.isPresent()
-        && previousEntry.get().getTerm() == request.getPreviousLogTerm();
+    return previousTerm.isPresent() && previousTerm.get() == request.getPreviousLogTerm();
   }
 
   private boolean reconcileEntries(List<RaftLogEntry> incomingEntries) {
+    long lastIncludedIndex = logStore.getLastIncludedIndex();
+
     for (int i = 0; i < incomingEntries.size(); i++) {
       RaftLogEntry incomingEntry = incomingEntries.get(i);
+
+      // Never append or overwrite entries already covered by a snapshot.
+      if (incomingEntry.getIndex() <= lastIncludedIndex) {
+        return false;
+      }
 
       Optional<RaftLogEntry> existingEntry = logStore.getEntry(incomingEntry.getIndex());
 

@@ -1,13 +1,10 @@
 package io.astradb.storage.rocksdb;
 
 import java.nio.file.Path;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Objects;
-import org.rocksdb.FlushOptions;
-import org.rocksdb.Options;
-import org.rocksdb.RocksDB;
-import org.rocksdb.RocksDBException;
-import org.rocksdb.WriteBatch;
-import org.rocksdb.WriteOptions;
+import org.rocksdb.*;
 
 /**
  * Persistent key-value storage backed by RocksDB.
@@ -159,6 +156,59 @@ public final class RocksDbStore implements AutoCloseable {
       }
 
       write(batch, sync);
+    }
+  }
+
+  /**
+   * Reads all key-value entries currently stored in RocksDB.
+   *
+   * @return entries in RocksDB iteration order
+   * @throws RocksDBException if reading the database fails
+   */
+  public List<RocksDbEntry> readAll() throws RocksDBException {
+    List<RocksDbEntry> entries = new ArrayList<>();
+
+    try (RocksIterator iterator = database.newIterator()) {
+      iterator.seekToFirst();
+
+      while (iterator.isValid()) {
+        entries.add(new RocksDbEntry(iterator.key(), iterator.value()));
+        iterator.next();
+      }
+
+      iterator.status();
+    }
+
+    return List.copyOf(entries);
+  }
+
+  /**
+   * Atomically replaces all existing entries with the supplied entries.
+   *
+   * @param entries replacement entries
+   * @throws RocksDBException if the replacement fails
+   */
+  public void replaceAll(List<RocksDbEntry> entries) throws RocksDBException {
+    Objects.requireNonNull(entries, "Entries must not be null");
+
+    try (RocksIterator iterator = database.newIterator();
+        WriteBatch batch = new WriteBatch()) {
+
+      iterator.seekToFirst();
+
+      while (iterator.isValid()) {
+        batch.delete(iterator.key());
+        iterator.next();
+      }
+
+      iterator.status();
+
+      for (RocksDbEntry entry : entries) {
+        Objects.requireNonNull(entry, "Entry must not be null");
+        batch.put(entry.getKey(), entry.getValue());
+      }
+
+      write(batch, true);
     }
   }
 

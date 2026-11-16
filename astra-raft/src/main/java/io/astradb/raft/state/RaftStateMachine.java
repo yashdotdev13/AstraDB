@@ -16,4 +16,17 @@ public interface RaftStateMachine {
    * @param command the command payload
    */
   void apply(long index, byte[] command);
+
+  /**
+   * Restores the application state from a Raft snapshot.
+   *
+   * <p>Implementations that support snapshot installation must override this method.
+   *
+   * @param snapshotData serialized snapshot data
+   * @throws UnsupportedOperationException if snapshot restoration is not supported
+   */
+  default void restore(byte[] snapshotData) {
+    throw new UnsupportedOperationException(
+        "Snapshot restoration is not supported by this state machine");
+  }
 }

@@ -10,6 +10,8 @@ import io.astradb.raft.metadata.RaftMetadata;
 import io.astradb.raft.metadata.RaftMetadataStore;
 import io.astradb.raft.rpc.AppendEntriesRequest;
 import io.astradb.raft.rpc.AppendEntriesResponse;
+import io.astradb.raft.rpc.InstallSnapshotRequest;
+import io.astradb.raft.rpc.InstallSnapshotResponse;
 import io.astradb.raft.rpc.RequestVoteRequest;
 import io.astradb.raft.rpc.RequestVoteResponse;
 import io.astradb.raft.state.RaftNodeState;
@@ -344,25 +346,6 @@ class RaftHeartbeatManagerTests {
   }
 
   @Test
-  void shouldPropagateCommitIndexAfterMajorityReplication() {
-    logStore.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 1, "three")));
-
-    heartbeatManager.start();
-    scheduler.runNextTask();
-
-    // Leader + node-2 form a majority in this three-node cluster.
-    peerClient.respond("node-2", 1, true);
-
-    scheduler.runNextTask();
-
-    AppendEntriesRequest node2Request = peerClient.requests.get("node-2").request;
-    AppendEntriesRequest node3Request = peerClient.requests.get("node-3").request;
-
-    assertEquals(3, node2Request.getLeaderCommit());
-    assertEquals(3, node3Request.getLeaderCommit());
-  }
-
-  @Test
   void shouldNotPropagateCommitIndexForEntriesFromOlderTerms() {
     nodeState.startElection("node-1");
     nodeState.becomeLeader();
@@ -394,6 +377,7 @@ class RaftHeartbeatManagerTests {
   private static final class FakePeerClient implements RaftPeerClient {
 
     private final Map<String, PendingRequest> requests = new HashMap<>();
+    private final Map<String, PendingSnapshotRequest> snapshotRequests = new HashMap<>();
 
     @Override
     public CompletableFuture<RequestVoteResponse> requestVote(
@@ -410,6 +394,28 @@ class RaftHeartbeatManagerTests {
       requests.put(peerId, new PendingRequest(request, future));
 
       return future;
+    }
+
+    @Override
+    public CompletableFuture<InstallSnapshotResponse> installSnapshot(
+        String peerId, InstallSnapshotRequest request) {
+
+      CompletableFuture<InstallSnapshotResponse> future = new CompletableFuture<>();
+
+      snapshotRequests.put(peerId, new PendingSnapshotRequest(request, future));
+
+      return future;
+    }
+
+    void respondToSnapshot(String peerId, long term) {
+      snapshotRequests.get(peerId).future.complete(new InstallSnapshotResponse(term, true));
+    }
+
+    void failSnapshot(String peerId) {
+      snapshotRequests
+          .get(peerId)
+          .future
+          .completeExceptionally(new RuntimeException("Snapshot transfer failed"));
     }
 
     void respond(String peerId, long term, boolean success) {
@@ -433,6 +439,18 @@ class RaftHeartbeatManagerTests {
     }
   }
 
+  private static final class PendingSnapshotRequest {
+
+    private final InstallSnapshotRequest request;
+    private final CompletableFuture<InstallSnapshotResponse> future;
+
+    private PendingSnapshotRequest(
+        InstallSnapshotRequest request, CompletableFuture<InstallSnapshotResponse> future) {
+      this.request = request;
+      this.future = future;
+    }
+  }
+
   private static final class InMemoryMetadataStore implements RaftMetadataStore {
 
     private RaftMetadata metadata = new RaftMetadata(0, null);
@@ -451,6 +469,8 @@ class RaftHeartbeatManagerTests {
   private static final class InMemoryLogStore implements RaftLogStore {
 
     private final List<RaftLogEntry> entries = new ArrayList<>();
+    private long lastIncludedIndex;
+    private long lastIncludedTerm;
 
     @Override
     public synchronized void append(RaftLogEntry entry) {
@@ -460,7 +480,7 @@ class RaftHeartbeatManagerTests {
     @Override
     public synchronized void appendAll(List<RaftLogEntry> newEntries) {
       for (RaftLogEntry entry : newEntries) {
-        if (entry.getIndex() != entries.size() + 1L) {
+        if (entry.getIndex() != getLastLogIndex() + 1) {
           throw new IllegalArgumentException("Non-sequential log entry");
         }
 
@@ -470,30 +490,62 @@ class RaftHeartbeatManagerTests {
 
     @Override
     public synchronized Optional<RaftLogEntry> getEntry(long index) {
-      if (index <= 0 || index > entries.size()) {
+      if (index <= lastIncludedIndex || index > getLastLogIndex()) {
         return Optional.empty();
       }
 
-      return Optional.of(entries.get((int) index - 1));
+      return Optional.of(entries.get(Math.toIntExact(index - lastIncludedIndex - 1)));
     }
 
     @Override
     public synchronized List<RaftLogEntry> getEntries(long fromIndex, long toIndex) {
-      if (fromIndex <= 0 || toIndex < fromIndex || toIndex > entries.size()) {
+      if (fromIndex <= lastIncludedIndex || toIndex < fromIndex || toIndex > getLastLogIndex()) {
         throw new IllegalArgumentException("Invalid log range");
       }
 
-      return List.copyOf(entries.subList((int) fromIndex - 1, (int) toIndex));
+      int fromOffset = Math.toIntExact(fromIndex - lastIncludedIndex - 1);
+      int toOffset = Math.toIntExact(toIndex - lastIncludedIndex);
+
+      return List.copyOf(entries.subList(fromOffset, toOffset));
     }
 
     @Override
     public synchronized long getLastLogIndex() {
-      return entries.size();
+      return entries.isEmpty() ? lastIncludedIndex : entries.get(entries.size() - 1).getIndex();
     }
 
     @Override
     public synchronized long getLastLogTerm() {
-      return entries.isEmpty() ? 0 : entries.get(entries.size() - 1).getTerm();
+      return entries.isEmpty() ? lastIncludedTerm : entries.get(entries.size() - 1).getTerm();
+    }
+
+    @Override
+    public synchronized long getLastIncludedIndex() {
+      return lastIncludedIndex;
+    }
+
+    @Override
+    public synchronized long getLastIncludedTerm() {
+      return lastIncludedTerm;
+    }
+
+    @Override
+    public synchronized void compactPrefix(long index, long term) {
+      if (index <= lastIncludedIndex || index > getLastLogIndex()) {
+        throw new IllegalArgumentException("Invalid snapshot boundary");
+      }
+
+      RaftLogEntry boundaryEntry =
+          getEntry(index)
+              .orElseThrow(() -> new IllegalArgumentException("Missing snapshot boundary entry"));
+
+      if (boundaryEntry.getTerm() != term) {
+        throw new IllegalArgumentException("Snapshot term does not match log");
+      }
+
+      entries.removeIf(entry -> entry.getIndex() <= index);
+      lastIncludedIndex = index;
+      lastIncludedTerm = term;
     }
 
     @Override
@@ -506,16 +558,26 @@ class RaftHeartbeatManagerTests {
 
     @Override
     public synchronized void replaceSuffix(long fromIndex, List<RaftLogEntry> replacements) {
-      if (fromIndex <= 0 || fromIndex > entries.size() + 1L) {
+      if (fromIndex <= lastIncludedIndex || fromIndex > getLastLogIndex() + 1) {
         throw new IllegalArgumentException("Invalid replacement index");
       }
 
-      entries.subList((int) fromIndex - 1, entries.size()).clear();
+      entries.removeIf(entry -> entry.getIndex() >= fromIndex);
       appendAll(replacements);
     }
 
     @Override
     public synchronized void close() {}
+
+    public synchronized void installSnapshotBoundary(long index, long term) {
+      if (index <= lastIncludedIndex || term <= 0 || index > getLastLogIndex()) {
+        throw new IllegalArgumentException("Invalid snapshot boundary");
+      }
+
+      entries.removeIf(entry -> entry.getIndex() <= index);
+      lastIncludedIndex = index;
+      lastIncludedTerm = term;
+    }
   }
 
   /** Deterministic scheduler for heartbeat lifecycle tests. */

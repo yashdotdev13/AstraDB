@@ -139,15 +139,18 @@ class ThreeNodeRaftIntegrationTests {
       assertEquals(1, replicatedEntry.getTerm());
       assertArrayEquals(payload, replicatedEntry.getPayload());
 
-      // The first replication round has not propagated leaderCommit yet.
+      // The initial replication requests carried leaderCommit = 0.
       assertEquals(0, follower.commitIndex.getCommitIndex());
     }
 
     // Second AppendEntries round: propagate the committed index.
-    heartbeatManager.sendHeartbeats();
-
+    // Retry while earlier asynchronous replication requests are still completing.
     assertTrue(
-        committedHeartbeatsReceived.await(5, TimeUnit.SECONDS),
+        awaitCondition(
+            () -> {
+              heartbeatManager.sendHeartbeats();
+              return committedHeartbeatsReceived.getCount() == 0;
+            }),
         "Both followers should receive the updated leader commit index");
 
     // Verify commit-index propagation across all three nodes.
@@ -198,12 +201,17 @@ class ThreeNodeRaftIntegrationTests {
     // Restore node-3 without changing its HTTP address.
     node3.setUnavailable(false);
 
-    // Retry replication. Node-3 should receive all three missing entries.
-    heartbeatManager.sendHeartbeats();
-
+    // Retry replication until Node-3 catches up.
+    // The leader may need multiple attempts to backtrack nextIndex
+    // before it can replicate the missing entries.
     assertTrue(
         awaitCondition(
-            () -> node3.logStore.getLastLogIndex() == 3 && node3.commitIndex.getCommitIndex() == 3),
+            () -> {
+              heartbeatManager.sendHeartbeats();
+
+              return node3.logStore.getLastLogIndex() == 3
+                  && node3.commitIndex.getCommitIndex() == 3;
+            }),
         "Node-3 should catch up and receive the leader's committed index");
 
     // Verify every replicated entry.
@@ -533,12 +541,6 @@ class ThreeNodeRaftIntegrationTests {
         AppendEntriesRpcResponse response = AppendEntriesRpcResponse.from(raftResponse);
 
         sendJson(exchange, response);
-
-        if (raftResponse.isSuccess()) {
-          successfulAppendEntriesCount.incrementAndGet();
-        } else {
-          failedAppendEntriesCount.incrementAndGet();
-        }
 
         // Track successful and rejected AppendEntries responses.
         if (raftResponse.isSuccess()) {

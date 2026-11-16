@@ -3,11 +3,15 @@ package io.astradb.node.transport;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.astradb.node.transport.dto.AppendEntriesRpcRequest;
 import io.astradb.node.transport.dto.AppendEntriesRpcResponse;
+import io.astradb.node.transport.dto.InstallSnapshotRpcRequest;
+import io.astradb.node.transport.dto.InstallSnapshotRpcResponse;
 import io.astradb.node.transport.dto.RequestVoteRpcRequest;
 import io.astradb.node.transport.dto.RequestVoteRpcResponse;
 import io.astradb.raft.election.RaftPeerClient;
 import io.astradb.raft.rpc.AppendEntriesRequest;
 import io.astradb.raft.rpc.AppendEntriesResponse;
+import io.astradb.raft.rpc.InstallSnapshotRequest;
+import io.astradb.raft.rpc.InstallSnapshotResponse;
 import io.astradb.raft.rpc.RequestVoteRequest;
 import io.astradb.raft.rpc.RequestVoteResponse;
 import java.io.IOException;
@@ -25,6 +29,7 @@ public final class HttpRaftPeerClient implements RaftPeerClient {
 
   private static final String REQUEST_VOTE_PATH = "/internal/raft/request-vote";
   private static final String APPEND_ENTRIES_PATH = "/internal/raft/append-entries";
+  private static final String INSTALL_SNAPSHOT_PATH = "/internal/raft/install-snapshot";
 
   private final HttpClient httpClient;
   private final ObjectMapper objectMapper;
@@ -69,6 +74,18 @@ public final class HttpRaftPeerClient implements RaftPeerClient {
             AppendEntriesRpcRequest.from(request),
             AppendEntriesRpcResponse.class)
         .thenApply(AppendEntriesRpcResponse::toRaftResponse);
+  }
+
+  @Override
+  public CompletableFuture<InstallSnapshotResponse> installSnapshot(
+      String peerId, InstallSnapshotRequest request) {
+
+    return post(
+            peerId,
+            INSTALL_SNAPSHOT_PATH,
+            InstallSnapshotRpcRequest.from(request),
+            InstallSnapshotRpcResponse.class)
+        .thenApply(InstallSnapshotRpcResponse::toRaftResponse);
   }
 
   private <T> CompletableFuture<T> post(

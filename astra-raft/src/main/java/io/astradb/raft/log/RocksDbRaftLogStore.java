@@ -22,6 +22,12 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
   private static final byte[] LAST_INDEX_KEY =
       "raft:metadata:last-index".getBytes(StandardCharsets.UTF_8);
 
+  private static final byte[] LAST_INCLUDED_INDEX_KEY =
+      "raft:metadata:last-included-index".getBytes(StandardCharsets.UTF_8);
+
+  private static final byte[] LAST_INCLUDED_TERM_KEY =
+      "raft:metadata:last-included-term".getBytes(StandardCharsets.UTF_8);
+
   private static final byte[] RAFT_METADATA_KEY =
       "raft:metadata:state".getBytes(StandardCharsets.UTF_8);
 
@@ -31,10 +37,17 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
 
   private long lastLogIndex;
 
+  private long lastIncludedIndex;
+  private long lastIncludedTerm;
+
   private RocksDbRaftLogStore(RocksDbStore store) {
     this.store = Objects.requireNonNull(store);
     this.serializer = new RaftLogSerializer();
+    this.lastIncludedIndex = loadMetadataValue(LAST_INCLUDED_INDEX_KEY);
+    this.lastIncludedTerm = loadMetadataValue(LAST_INCLUDED_TERM_KEY);
     this.lastLogIndex = loadLastLogIndex();
+
+    validateSnapshotBoundary();
     validateRecoveredLog();
   }
 
@@ -148,6 +161,11 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
         throw new IllegalArgumentException("Requested range exceeds the last log index");
       }
 
+      if (fromIndex <= lastIncludedIndex) {
+        throw new IllegalArgumentException(
+            "Requested range includes entries that have been compacted");
+      }
+
       List<RaftLogEntry> entries = new ArrayList<>();
 
       for (long index = fromIndex; ; index++) {
@@ -187,6 +205,10 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
     lock.readLock().lock();
 
     try {
+      if (lastLogIndex == lastIncludedIndex) {
+        return lastIncludedTerm;
+      }
+
       if (lastLogIndex == 0) {
         return 0;
       }
@@ -198,7 +220,6 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
       }
 
       return entry.getTerm();
-
     } finally {
       lock.readLock().unlock();
     }
@@ -211,6 +232,11 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
     lock.writeLock().lock();
 
     try {
+      if (fromIndex <= lastIncludedIndex) {
+        throw new IllegalArgumentException(
+            "Cannot truncate entries at or before the snapshot boundary");
+      }
+
       if (fromIndex > lastLogIndex) {
         return;
       }
@@ -255,6 +281,12 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
 
     lock.writeLock().lock();
     try {
+      // Never modify entries that are already included in a snapshot.
+      if (fromIndex <= lastIncludedIndex) {
+        throw new IllegalArgumentException(
+            "Cannot replace entries at or before the snapshot boundary");
+      }
+
       if (fromIndex > lastLogIndex && fromIndex - lastLogIndex > 1) {
         throw new IllegalArgumentException("Replacement index cannot create a gap in the Raft log");
       }
@@ -273,8 +305,8 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
       // Add replacement entries, ensuring consecutive indexes.
       long expectedIndex = fromIndex;
 
-      for (RaftLogEntry entry : entries) {
-        Objects.requireNonNull(entry, "Log entry must not be null");
+      for (int i = 0; i < entries.size(); i++) {
+        RaftLogEntry entry = Objects.requireNonNull(entries.get(i), "Log entry must not be null");
 
         if (entry.getIndex() != expectedIndex) {
           throw new IllegalArgumentException(
@@ -283,11 +315,13 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
 
         operations.add(BatchOperation.put(entryKey(entry.getIndex()), serializer.serialize(entry)));
 
-        if (expectedIndex == Long.MAX_VALUE && entry != entries.get(entries.size() - 1)) {
+        if (expectedIndex == Long.MAX_VALUE && i < entries.size() - 1) {
           throw new IllegalArgumentException("Raft log index overflow");
         }
 
-        expectedIndex++;
+        if (expectedIndex < Long.MAX_VALUE) {
+          expectedIndex++;
+        }
       }
 
       long newLastLogIndex =
@@ -335,6 +369,166 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
       store.writeBatch(List.of(BatchOperation.put(RAFT_METADATA_KEY, serialized)), true);
     } catch (RocksDBException exception) {
       throw new RaftLogException("Failed to save Raft metadata", exception);
+    } finally {
+      lock.writeLock().unlock();
+    }
+  }
+
+  @Override
+  public long getFirstLogIndex() {
+    lock.readLock().lock();
+    try {
+      return lastIncludedIndex + 1;
+    } finally {
+      lock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public long getLastIncludedIndex() {
+    lock.readLock().lock();
+    try {
+      return lastIncludedIndex;
+    } finally {
+      lock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public long getLastIncludedTerm() {
+    lock.readLock().lock();
+    try {
+      return lastIncludedTerm;
+    } finally {
+      lock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public Optional<Long> getTerm(long index) {
+    validateIndex(index);
+
+    lock.readLock().lock();
+    try {
+      if (index == lastIncludedIndex && lastIncludedIndex > 0) {
+        return Optional.of(lastIncludedTerm);
+      }
+
+      if (index <= lastIncludedIndex) {
+        return Optional.empty();
+      }
+
+      RaftLogEntry entry = readEntry(index);
+      return entry == null ? Optional.empty() : Optional.of(entry.getTerm());
+    } finally {
+      lock.readLock().unlock();
+    }
+  }
+
+  @Override
+  public void compactPrefix(long lastIncludedIndex, long lastIncludedTerm) {
+    validateIndex(lastIncludedIndex);
+
+    if (lastIncludedTerm <= 0) {
+      throw new IllegalArgumentException("Snapshot term must be positive");
+    }
+
+    lock.writeLock().lock();
+
+    try {
+      if (lastIncludedIndex <= this.lastIncludedIndex) {
+        throw new IllegalArgumentException(
+            "Snapshot index must be greater than the existing snapshot boundary");
+      }
+
+      if (lastIncludedIndex > lastLogIndex) {
+        throw new IllegalArgumentException("Snapshot index cannot exceed the last log index");
+      }
+
+      RaftLogEntry boundaryEntry = readEntry(lastIncludedIndex);
+
+      if (boundaryEntry == null || boundaryEntry.getTerm() != lastIncludedTerm) {
+        throw new IllegalArgumentException(
+            "Snapshot boundary does not match the existing Raft log");
+      }
+
+      List<BatchOperation<byte[], byte[]>> operations = new ArrayList<>();
+
+      for (long index = this.lastIncludedIndex + 1; index <= lastIncludedIndex; index++) {
+        operations.add(BatchOperation.delete(entryKey(index)));
+
+        if (index == Long.MAX_VALUE) {
+          break;
+        }
+      }
+
+      operations.add(BatchOperation.put(LAST_INCLUDED_INDEX_KEY, encodeLong(lastIncludedIndex)));
+      operations.add(BatchOperation.put(LAST_INCLUDED_TERM_KEY, encodeLong(lastIncludedTerm)));
+
+      store.writeBatch(operations, true);
+
+      this.lastIncludedIndex = lastIncludedIndex;
+      this.lastIncludedTerm = lastIncludedTerm;
+    } catch (RocksDBException exception) {
+      throw new RaftLogException("Failed to compact Raft log prefix", exception);
+    } finally {
+      lock.writeLock().unlock();
+    }
+  }
+
+  @Override
+  public void installSnapshotBoundary(long snapshotIndex, long snapshotTerm) {
+    validateIndex(snapshotIndex);
+
+    if (snapshotTerm <= 0) {
+      throw new IllegalArgumentException("Snapshot term must be positive");
+    }
+
+    lock.writeLock().lock();
+
+    try {
+      if (snapshotIndex < lastIncludedIndex) {
+        throw new IllegalArgumentException(
+            "Snapshot index cannot be behind the existing snapshot boundary");
+      }
+
+      if (snapshotIndex == lastIncludedIndex) {
+        if (snapshotTerm != lastIncludedTerm) {
+          throw new IllegalArgumentException(
+              "Snapshot term conflicts with the existing snapshot boundary");
+        }
+        return;
+      }
+
+      RaftLogEntry boundaryEntry = snapshotIndex <= lastLogIndex ? readEntry(snapshotIndex) : null;
+
+      boolean preserveSuffix = boundaryEntry != null && boundaryEntry.getTerm() == snapshotTerm;
+
+      List<BatchOperation<byte[], byte[]>> operations = new ArrayList<>();
+
+      long deletionEnd = preserveSuffix ? snapshotIndex : lastLogIndex;
+
+      for (long index = lastIncludedIndex + 1; index <= deletionEnd; index++) {
+        operations.add(BatchOperation.delete(entryKey(index)));
+
+        if (index == Long.MAX_VALUE) {
+          break;
+        }
+      }
+
+      long newLastLogIndex = preserveSuffix ? lastLogIndex : snapshotIndex;
+
+      operations.add(BatchOperation.put(LAST_INCLUDED_INDEX_KEY, encodeLong(snapshotIndex)));
+      operations.add(BatchOperation.put(LAST_INCLUDED_TERM_KEY, encodeLong(snapshotTerm)));
+      operations.add(BatchOperation.put(LAST_INDEX_KEY, encodeLong(newLastLogIndex)));
+
+      store.writeBatch(operations, true);
+
+      lastIncludedIndex = snapshotIndex;
+      lastIncludedTerm = snapshotTerm;
+      lastLogIndex = newLastLogIndex;
+    } catch (RocksDBException exception) {
+      throw new RaftLogException("Failed to install Raft snapshot boundary", exception);
     } finally {
       lock.writeLock().unlock();
     }
@@ -432,6 +626,44 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
     }
   }
 
+  private long loadMetadataValue(byte[] key) {
+    try {
+      byte[] data = store.get(key);
+
+      if (data == null) {
+        return 0;
+      }
+
+      if (data.length != Long.BYTES) {
+        throw new RaftLogException("Invalid persisted Raft snapshot metadata");
+      }
+
+      long value = ByteBuffer.wrap(data).getLong();
+
+      if (value < 0) {
+        throw new RaftLogException("Persisted Raft snapshot metadata cannot be negative");
+      }
+
+      return value;
+    } catch (RocksDBException exception) {
+      throw new RaftLogException("Failed to recover Raft snapshot metadata", exception);
+    }
+  }
+
+  private void validateSnapshotBoundary() {
+    if (lastIncludedIndex == 0 && lastIncludedTerm != 0) {
+      throw new RaftLogException("Snapshot term cannot exist without a snapshot index");
+    }
+
+    if (lastIncludedIndex > 0 && lastIncludedTerm == 0) {
+      throw new RaftLogException("Snapshot index must have a valid term");
+    }
+
+    if (lastIncludedIndex > lastLogIndex) {
+      throw new RaftLogException("Snapshot index cannot exceed the last log index");
+    }
+  }
+
   private static byte[] entryKey(long index) {
     ByteBuffer buffer = ByteBuffer.allocate(ENTRY_PREFIX.length + Long.BYTES);
     buffer.put(ENTRY_PREFIX);
@@ -450,7 +682,11 @@ public final class RocksDbRaftLogStore implements RaftLogStore, RaftMetadataStor
   }
 
   private void validateRecoveredLog() {
-    for (long index = 1; index <= lastLogIndex; index++) {
+    if (lastIncludedIndex == Long.MAX_VALUE) {
+      return;
+    }
+
+    for (long index = lastIncludedIndex + 1; index <= lastLogIndex; index++) {
       RaftLogEntry entry = readEntry(index);
 
       if (entry == null) {

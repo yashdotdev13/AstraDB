@@ -1,6 +1,7 @@
 package io.astradb.node.config;
 
 import io.astradb.raft.log.RocksDbRaftLogStore;
+import io.astradb.raft.snapshot.RocksDbRaftSnapshotStore;
 import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import java.io.IOException;
@@ -20,14 +21,21 @@ public class RaftStorageConfiguration {
 
     Path databasePath = Path.of(storagePath).toAbsolutePath().normalize();
 
-    try {
-      Files.createDirectories(databasePath);
-    } catch (IOException exception) {
-      throw new IllegalStateException(
-          "Failed to create Raft storage directory: " + databasePath, exception);
-    }
+    createStorageDirectory(databasePath);
 
     return RocksDbRaftLogStore.open(databasePath);
+  }
+
+  @Bean(destroyMethod = "close")
+  public RocksDbRaftSnapshotStore raftSnapshotStore(
+      @Value("${astra.raft.snapshot-storage-path:./data/raft-snapshots}")
+          String snapshotStoragePath) {
+
+    Path databasePath = Path.of(snapshotStoragePath).toAbsolutePath().normalize();
+
+    createStorageDirectory(databasePath);
+
+    return RocksDbRaftSnapshotStore.open(databasePath);
   }
 
   @Bean
@@ -38,5 +46,14 @@ public class RaftStorageConfiguration {
   @Bean
   public RaftCommitIndex raftCommitIndex() {
     return new RaftCommitIndex();
+  }
+
+  private void createStorageDirectory(Path databasePath) {
+    try {
+      Files.createDirectories(databasePath);
+    } catch (IOException exception) {
+      throw new IllegalStateException(
+          "Failed to create Raft storage directory: " + databasePath, exception);
+    }
   }
 }
