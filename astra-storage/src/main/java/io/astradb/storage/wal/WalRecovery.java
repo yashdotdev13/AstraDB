@@ -26,14 +26,30 @@ public final class WalRecovery {
   }
 
   /**
-   * Recovers all operations belonging to committed transactions.
+   * Recovers all committed operations from the WAL.
    *
    * @param walPath path to the WAL file
    * @return immutable list of recovered records in WAL order
    * @throws IOException if reading or deserializing the WAL fails
    */
   public List<WalRecord> recover(Path walPath) throws IOException {
+    return recover(walPath, LogSequenceNumber.of(0));
+  }
+
+  /**
+   * Recovers committed operations written after the specified checkpoint.
+   *
+   * <p>The checkpoint must represent a complete transaction boundary.
+   *
+   * @param walPath path to the WAL file
+   * @param checkpointLsn last WAL sequence number already represented in durable storage
+   * @return immutable list of recovered records in WAL order
+   * @throws IOException if reading or deserializing the WAL fails
+   */
+  public List<WalRecord> recover(Path walPath, LogSequenceNumber checkpointLsn) throws IOException {
+
     Objects.requireNonNull(walPath, "WAL path must not be null");
+    Objects.requireNonNull(checkpointLsn, "Checkpoint LSN must not be null");
 
     List<WalRecord> records;
 
@@ -41,29 +57,32 @@ public final class WalRecovery {
       records = reader.readAll();
     }
 
+    long lastIncludedLsn = checkpointLsn.getValue();
+
+    List<WalRecord> recordsAfterCheckpoint =
+        records.stream().filter(record -> record.getLsn().getValue() > lastIncludedLsn).toList();
+
     Map<TransactionId, List<WalRecord>> transactions = new HashMap<>();
     Set<TransactionId> committedTransactions = new HashSet<>();
     Set<TransactionId> abortedTransactions = new HashSet<>();
 
-    for (WalRecord record : records) {
+    for (WalRecord record : recordsAfterCheckpoint) {
       TransactionId transactionId = record.getTransactionId();
 
+      transactions.computeIfAbsent(transactionId, ignored -> new ArrayList<>()).add(record);
+
       switch (record.getType()) {
-        case BEGIN:
-          transactions.computeIfAbsent(transactionId, key -> new ArrayList<>()).add(record);
-          break;
-
-        case PUT:
-        case DELETE:
-          transactions.computeIfAbsent(transactionId, key -> new ArrayList<>()).add(record);
-          break;
-
         case COMMIT:
           committedTransactions.add(transactionId);
           break;
 
         case ABORT:
           abortedTransactions.add(transactionId);
+          break;
+
+        case BEGIN:
+        case PUT:
+        case DELETE:
           break;
 
         default:
@@ -73,7 +92,7 @@ public final class WalRecovery {
 
     List<WalRecord> recoveredRecords = new ArrayList<>();
 
-    for (WalRecord record : records) {
+    for (WalRecord record : recordsAfterCheckpoint) {
       TransactionId transactionId = record.getTransactionId();
 
       if (committedTransactions.contains(transactionId)

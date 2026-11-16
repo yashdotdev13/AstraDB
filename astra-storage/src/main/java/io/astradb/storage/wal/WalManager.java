@@ -145,6 +145,23 @@ public final class WalManager implements AutoCloseable {
   }
 
   /**
+   * Reads WAL records written after the specified checkpoint.
+   *
+   * @param checkpointLsn last WAL sequence number already represented in durable storage
+   * @return immutable list of records after the checkpoint, in WAL order
+   * @throws IOException if reading the WAL fails
+   */
+  public List<WalRecord> readAllAfter(LogSequenceNumber checkpointLsn) throws IOException {
+    Objects.requireNonNull(checkpointLsn, "Checkpoint LSN must not be null");
+
+    long lastIncludedLsn = checkpointLsn.getValue();
+
+    return readAll().stream()
+        .filter(record -> record.getLsn().getValue() > lastIncludedLsn)
+        .toList();
+  }
+
+  /**
    * Reads all records currently present in the WAL.
    *
    * @return immutable list of records

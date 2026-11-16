@@ -2,6 +2,7 @@ package io.astradb.raft.state;
 
 import io.astradb.raft.log.RaftLogEntry;
 import io.astradb.raft.log.RaftLogStore;
+import io.astradb.raft.snapshot.RaftSnapshot;
 import java.util.Objects;
 import java.util.Optional;
 
@@ -51,6 +52,30 @@ public final class RaftStateMachineApplier {
       // Advance only after successful application.
       lastApplied = nextIndex;
     }
+
+    return lastApplied;
+  }
+
+  /**
+   * Restores the state machine from a snapshot.
+   *
+   * @param snapshot snapshot to install
+   * @return the snapshot's last included index
+   */
+  public synchronized long installSnapshot(RaftSnapshot snapshot) {
+    Objects.requireNonNull(snapshot, "Snapshot must not be null");
+
+    long snapshotIndex = snapshot.getLastIncludedIndex();
+
+    if (snapshotIndex < lastApplied) {
+      throw new IllegalArgumentException("Snapshot index cannot be behind the last applied index");
+    }
+
+    // Restore application state before advancing Raft progress.
+    stateMachine.restore(snapshot.getData());
+
+    commitIndex.advanceTo(snapshotIndex);
+    lastApplied = snapshotIndex;
 
     return lastApplied;
   }

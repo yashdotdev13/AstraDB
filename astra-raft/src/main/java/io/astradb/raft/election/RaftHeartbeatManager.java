@@ -4,6 +4,10 @@ import io.astradb.raft.log.RaftLogEntry;
 import io.astradb.raft.log.RaftLogStore;
 import io.astradb.raft.rpc.AppendEntriesRequest;
 import io.astradb.raft.rpc.AppendEntriesResponse;
+import io.astradb.raft.rpc.InstallSnapshotRequest;
+import io.astradb.raft.rpc.InstallSnapshotResponse;
+import io.astradb.raft.snapshot.RaftSnapshot;
+import io.astradb.raft.snapshot.RaftSnapshotStore;
 import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import io.astradb.raft.state.RaftRole;
@@ -31,8 +35,11 @@ public final class RaftHeartbeatManager implements AutoCloseable {
   private final long heartbeatIntervalMillis;
   private final RaftCommitIndexTracker commitIndexTracker;
   private final Optional<RaftStateMachineApplier> stateMachineApplier;
+  private final Optional<RaftSnapshotStore> snapshotStore;
 
   private final Map<String, RaftPeerReplicationState> replicationStates = new HashMap<>();
+
+  private final Map<String, Object> replicationRequestsInFlight = new HashMap<>();
 
   private ScheduledFuture<?> heartbeatTask;
   private boolean started;
@@ -84,7 +91,57 @@ public final class RaftHeartbeatManager implements AutoCloseable {
         scheduler,
         heartbeatIntervalMillis,
         commitIndex,
+        Optional.empty(),
         Optional.empty());
+  }
+
+  /** Creates a heartbeat manager with snapshot replication enabled. */
+  public RaftHeartbeatManager(
+      String localNodeId,
+      Set<String> peerIds,
+      RaftNodeState nodeState,
+      RaftLogStore logStore,
+      RaftPeerClient peerClient,
+      ScheduledExecutorService scheduler,
+      long heartbeatIntervalMillis,
+      RaftSnapshotStore snapshotStore) {
+
+    this(
+        localNodeId,
+        peerIds,
+        nodeState,
+        logStore,
+        peerClient,
+        scheduler,
+        heartbeatIntervalMillis,
+        new RaftCommitIndex(),
+        Optional.empty(),
+        Optional.of(Objects.requireNonNull(snapshotStore, "Snapshot store must not be null")));
+  }
+
+  /** Creates a heartbeat manager with shared commit index and snapshot replication. */
+  public RaftHeartbeatManager(
+      String localNodeId,
+      Set<String> peerIds,
+      RaftNodeState nodeState,
+      RaftLogStore logStore,
+      RaftPeerClient peerClient,
+      ScheduledExecutorService scheduler,
+      long heartbeatIntervalMillis,
+      RaftCommitIndex commitIndex,
+      RaftSnapshotStore snapshotStore) {
+
+    this(
+        localNodeId,
+        peerIds,
+        nodeState,
+        logStore,
+        peerClient,
+        scheduler,
+        heartbeatIntervalMillis,
+        commitIndex,
+        Optional.empty(),
+        Optional.of(Objects.requireNonNull(snapshotStore, "Snapshot store must not be null")));
   }
 
   /**
@@ -113,7 +170,39 @@ public final class RaftHeartbeatManager implements AutoCloseable {
         heartbeatIntervalMillis,
         commitIndex,
         Optional.of(
-            Objects.requireNonNull(stateMachineApplier, "State machine applier must not be null")));
+            Objects.requireNonNull(stateMachineApplier, "State machine applier must not be null")),
+        Optional.empty());
+  }
+
+  /**
+   * Creates a heartbeat manager with shared commit index, state-machine application and snapshots.
+   *
+   * <p>The supplied applier must use the exact same commit-index instance.
+   */
+  public RaftHeartbeatManager(
+      String localNodeId,
+      Set<String> peerIds,
+      RaftNodeState nodeState,
+      RaftLogStore logStore,
+      RaftPeerClient peerClient,
+      ScheduledExecutorService scheduler,
+      long heartbeatIntervalMillis,
+      RaftCommitIndex commitIndex,
+      RaftStateMachineApplier stateMachineApplier,
+      RaftSnapshotStore snapshotStore) {
+
+    this(
+        localNodeId,
+        peerIds,
+        nodeState,
+        logStore,
+        peerClient,
+        scheduler,
+        heartbeatIntervalMillis,
+        commitIndex,
+        Optional.of(
+            Objects.requireNonNull(stateMachineApplier, "State machine applier must not be null")),
+        Optional.of(Objects.requireNonNull(snapshotStore, "Snapshot store must not be null")));
   }
 
   private RaftHeartbeatManager(
@@ -125,7 +214,8 @@ public final class RaftHeartbeatManager implements AutoCloseable {
       ScheduledExecutorService scheduler,
       long heartbeatIntervalMillis,
       RaftCommitIndex commitIndex,
-      Optional<RaftStateMachineApplier> stateMachineApplier) {
+      Optional<RaftStateMachineApplier> stateMachineApplier,
+      Optional<RaftSnapshotStore> snapshotStore) {
 
     this.localNodeId = Objects.requireNonNull(localNodeId, "Local node ID must not be null");
 
@@ -161,6 +251,9 @@ public final class RaftHeartbeatManager implements AutoCloseable {
 
     this.stateMachineApplier =
         Objects.requireNonNull(stateMachineApplier, "State machine applier must not be null");
+
+    this.snapshotStore =
+        Objects.requireNonNull(snapshotStore, "Snapshot store optional must not be null");
 
     this.stateMachineApplier.ifPresent(
         applier -> {
@@ -204,7 +297,7 @@ public final class RaftHeartbeatManager implements AutoCloseable {
     }
   }
 
-  /** Sends AppendEntries RPCs immediately to all configured peers. */
+  /** Sends AppendEntries or InstallSnapshot RPCs immediately to all configured peers. */
   public synchronized void sendHeartbeats() {
     if (closed || !started || nodeState.getRole() != RaftRole.LEADER) {
       stopScheduling();
@@ -223,6 +316,10 @@ public final class RaftHeartbeatManager implements AutoCloseable {
   }
 
   private void sendAppendEntries(String peerId, long term) {
+    if (replicationRequestsInFlight.containsKey(peerId)) {
+      return;
+    }
+
     RaftPeerReplicationState replicationState = replicationStates.get(peerId);
 
     if (replicationState == null) {
@@ -230,6 +327,13 @@ public final class RaftHeartbeatManager implements AutoCloseable {
     }
 
     long nextIndex = replicationState.getNextIndex();
+    long lastIncludedIndex = logStore.getLastIncludedIndex();
+
+    if (nextIndex <= lastIncludedIndex) {
+      sendInstallSnapshot(peerId, term);
+      return;
+    }
+
     long previousLogIndex = nextIndex - 1;
     long lastLogIndex = logStore.getLastLogIndex();
 
@@ -237,12 +341,11 @@ public final class RaftHeartbeatManager implements AutoCloseable {
         previousLogIndex == 0
             ? 0
             : logStore
-                .getEntry(previousLogIndex)
-                .map(RaftLogEntry::getTerm)
+                .getTerm(previousLogIndex)
                 .orElseThrow(
                     () ->
                         new IllegalStateException(
-                            "Missing previous log entry at index " + previousLogIndex));
+                            "Missing previous log term at index " + previousLogIndex));
 
     List<RaftLogEntry> entries =
         nextIndex > lastLogIndex ? List.of() : logStore.getEntries(nextIndex, lastLogIndex);
@@ -259,11 +362,125 @@ public final class RaftHeartbeatManager implements AutoCloseable {
             entries,
             commitIndexTracker.getCommitIndex());
 
-    peerClient
-        .appendEntries(peerId, request)
-        .whenComplete(
-            (response, error) ->
-                handleResponse(peerId, term, nextIndex, replicatedThroughIndex, response, error));
+    Object requestToken = new Object();
+    replicationRequestsInFlight.put(peerId, requestToken);
+
+    try {
+      peerClient
+          .appendEntries(peerId, request)
+          .whenComplete(
+              (response, error) ->
+                  handleResponse(
+                      peerId,
+                      term,
+                      nextIndex,
+                      replicatedThroughIndex,
+                      requestToken,
+                      response,
+                      error));
+    } catch (RuntimeException exception) {
+      replicationRequestsInFlight.remove(peerId, requestToken);
+      throw exception;
+    }
+  }
+
+  private void sendInstallSnapshot(String peerId, long term) {
+    if (snapshotStore.isEmpty() || replicationRequestsInFlight.containsKey(peerId)) {
+      return;
+    }
+
+    RaftSnapshot snapshot = snapshotStore.get().load().orElse(null);
+
+    if (snapshot == null) {
+      return;
+    }
+
+    long snapshotIndex = snapshot.getLastIncludedIndex();
+    long lastIncludedIndex = logStore.getLastIncludedIndex();
+
+    // Never send a snapshot older than the leader's compacted log boundary.
+    if (snapshotIndex < lastIncludedIndex || snapshotIndex > logStore.getLastLogIndex()) {
+      return;
+    }
+
+    // Verify that the snapshot represents the same log position and term.
+    Optional<Long> localSnapshotTerm = logStore.getTerm(snapshotIndex);
+
+    if (localSnapshotTerm.isEmpty() || localSnapshotTerm.get() != snapshot.getLastIncludedTerm()) {
+      return;
+    }
+
+    InstallSnapshotRequest request =
+        new InstallSnapshotRequest(
+            term, localNodeId, snapshotIndex, snapshot.getLastIncludedTerm(), snapshot.getData());
+
+    // Track this specific transfer so stale responses cannot affect newer transfers.
+    Object transferToken = new Object();
+    replicationRequestsInFlight.put(peerId, transferToken);
+
+    try {
+      peerClient
+          .installSnapshot(peerId, request)
+          .whenComplete(
+              (response, error) ->
+                  handleInstallSnapshotResponse(
+                      peerId, term, snapshotIndex, transferToken, response, error));
+    } catch (RuntimeException exception) {
+      replicationRequestsInFlight.remove(peerId, transferToken);
+      throw exception;
+    }
+  }
+
+  private synchronized void handleInstallSnapshotResponse(
+      String peerId,
+      long requestTerm,
+      long snapshotIndex,
+      Object transferToken,
+      InstallSnapshotResponse response,
+      Throwable error) {
+
+    Object activeTransfer = replicationRequestsInFlight.get(peerId);
+
+    // Remove only the transfer associated with this response.
+    if (activeTransfer == transferToken) {
+      replicationRequestsInFlight.remove(peerId);
+    }
+
+    // Always honor a higher term, even if this response belongs to an old transfer.
+    if (response != null && response.getTerm() > nodeState.getCurrentTerm()) {
+      nodeState.advanceTermIfHigher(response.getTerm());
+      stopScheduling();
+      return;
+    }
+
+    // Ignore stale responses and unsuccessful RPC completions.
+    if (activeTransfer != transferToken
+        || closed
+        || !started
+        || error != null
+        || response == null) {
+      return;
+    }
+
+    if (requestTerm != nodeState.getCurrentTerm()
+        || nodeState.getRole() != RaftRole.LEADER
+        || response.getTerm() != requestTerm) {
+      return;
+    }
+
+    RaftPeerReplicationState replicationState = replicationStates.get(peerId);
+
+    if (replicationState == null) {
+      return;
+    }
+
+    // Never regress progress when an older asynchronous response arrives.
+    if (!response.isSuccess()) {
+      return;
+    }
+    replicationState.recordSuccess(snapshotIndex);
+
+    advanceCommitIndex();
   }
 
   private synchronized void handleResponse(
@@ -271,8 +488,19 @@ public final class RaftHeartbeatManager implements AutoCloseable {
       long requestTerm,
       long attemptedNextIndex,
       long replicatedThroughIndex,
+      Object requestToken,
       AppendEntriesResponse response,
       Throwable error) {
+
+    Object activeRequest = replicationRequestsInFlight.get(peerId);
+
+    if (activeRequest == requestToken) {
+      replicationRequestsInFlight.remove(peerId);
+    }
+
+    if (activeRequest != requestToken) {
+      return;
+    }
 
     if (closed || !started || error != null || response == null) {
       return;
@@ -361,6 +589,7 @@ public final class RaftHeartbeatManager implements AutoCloseable {
   public synchronized void stop() {
     started = false;
     stopScheduling();
+    replicationRequestsInFlight.clear();
   }
 
   /** Closes the manager without shutting down the caller-owned scheduler. */

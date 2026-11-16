@@ -307,6 +307,259 @@ class RocksDbRaftLogStoreTests {
     store.close();
   }
 
+  @Test
+  void shouldCompactLogPrefixAndPreserveRemainingEntries() {
+    try (RocksDbRaftLogStore store = open("compact-prefix-db")) {
+      store.appendAll(
+          List.of(
+              entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 2, "three"), entry(4, 2, "four")));
+
+      store.compactPrefix(2, 1);
+
+      assertEquals(2, store.getLastIncludedIndex());
+      assertEquals(1, store.getLastIncludedTerm());
+      assertEquals(3, store.getFirstLogIndex());
+      assertEquals(4, store.getLastLogIndex());
+
+      assertTrue(store.getEntry(1).isEmpty());
+      assertTrue(store.getEntry(2).isEmpty());
+      assertTrue(store.getEntry(3).isPresent());
+      assertTrue(store.getEntry(4).isPresent());
+
+      assertEquals(1, store.getTerm(2).orElseThrow());
+      assertEquals(2, store.getTerm(3).orElseThrow());
+    }
+  }
+
+  @Test
+  void shouldPreserveSnapshotBoundaryAfterReopening() {
+    Path databasePath = tempDir.resolve("compact-recovery-db");
+
+    try (RocksDbRaftLogStore store = RocksDbRaftLogStore.open(databasePath)) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 2, "three")));
+
+      store.compactPrefix(2, 1);
+    }
+
+    try (RocksDbRaftLogStore reopened = RocksDbRaftLogStore.open(databasePath)) {
+      assertEquals(2, reopened.getLastIncludedIndex());
+      assertEquals(1, reopened.getLastIncludedTerm());
+      assertEquals(3, reopened.getFirstLogIndex());
+      assertEquals(3, reopened.getLastLogIndex());
+
+      assertTrue(reopened.getEntry(1).isEmpty());
+      assertTrue(reopened.getEntry(2).isEmpty());
+      assertEquals(1, reopened.getTerm(2).orElseThrow());
+    }
+  }
+
+  @Test
+  void shouldRejectCompactionWhenBoundaryTermDoesNotMatch() {
+    try (RocksDbRaftLogStore store = open("invalid-compact-term-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 2, "two")));
+
+      assertThrows(IllegalArgumentException.class, () -> store.compactPrefix(2, 1));
+
+      assertEquals(0, store.getLastIncludedIndex());
+      assertTrue(store.getEntry(1).isPresent());
+    }
+  }
+
+  @Test
+  void shouldRejectCompactionBeyondLastLogIndex() {
+    try (RocksDbRaftLogStore store = open("compact-beyond-last-db")) {
+      store.append(entry(1, 1, "one"));
+
+      assertThrows(IllegalArgumentException.class, () -> store.compactPrefix(2, 1));
+    }
+  }
+
+  @Test
+  void shouldPreserveLastLogTermWhenEntireLogIsCompacted() {
+    try (RocksDbRaftLogStore store = open("fully-compacted-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 2, "three")));
+
+      store.compactPrefix(3, 2);
+
+      assertEquals(3, store.getLastIncludedIndex());
+      assertEquals(2, store.getLastIncludedTerm());
+      assertEquals(4, store.getFirstLogIndex());
+      assertEquals(3, store.getLastLogIndex());
+      assertEquals(2, store.getLastLogTerm());
+    }
+  }
+
+  @Test
+  void shouldRejectReadingCompactedEntries() {
+    try (RocksDbRaftLogStore store = open("read-compacted-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two")));
+
+      store.compactPrefix(1, 1);
+
+      assertThrows(IllegalArgumentException.class, () -> store.getEntries(1, 2));
+    }
+  }
+
+  @Test
+  void shouldRejectTruncatingCompactedPrefix() {
+    try (RocksDbRaftLogStore store = open("truncate-compacted-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two")));
+
+      store.compactPrefix(1, 1);
+
+      assertThrows(IllegalArgumentException.class, () -> store.truncateSuffix(1));
+
+      assertEquals(2, store.getLastLogIndex());
+      assertEquals(1, store.getLastIncludedIndex());
+    }
+  }
+
+  @Test
+  void shouldRejectReplacingCompactedPrefix() {
+    try (RocksDbRaftLogStore store = open("replace-compacted-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two")));
+
+      store.compactPrefix(1, 1);
+
+      assertThrows(
+          IllegalArgumentException.class,
+          () -> store.replaceSuffix(1, List.of(entry(1, 2, "replacement"))));
+
+      assertEquals(2, store.getLastLogIndex());
+      assertEquals(1, store.getLastIncludedIndex());
+    }
+  }
+
+  @Test
+  void shouldInstallSnapshotBoundaryAndPreserveMatchingSuffix() {
+    try (RocksDbRaftLogStore store = open("install-snapshot-preserve-suffix-db")) {
+      store.appendAll(
+          List.of(
+              entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 2, "three"), entry(4, 2, "four")));
+
+      store.installSnapshotBoundary(2, 1);
+
+      assertEquals(2, store.getLastIncludedIndex());
+      assertEquals(1, store.getLastIncludedTerm());
+      assertEquals(3, store.getFirstLogIndex());
+      assertEquals(4, store.getLastLogIndex());
+
+      assertTrue(store.getEntry(1).isEmpty());
+      assertTrue(store.getEntry(2).isEmpty());
+      assertTrue(store.getEntry(3).isPresent());
+      assertTrue(store.getEntry(4).isPresent());
+
+      assertEquals(1, store.getTerm(2).orElseThrow());
+    }
+  }
+
+  @Test
+  void shouldDiscardEntireLogWhenSnapshotBoundaryTermDoesNotMatch() {
+    try (RocksDbRaftLogStore store = open("install-snapshot-conflicting-term-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 2, "two"), entry(3, 2, "three")));
+
+      store.installSnapshotBoundary(2, 1);
+
+      assertEquals(2, store.getLastIncludedIndex());
+      assertEquals(1, store.getLastIncludedTerm());
+      assertEquals(3, store.getFirstLogIndex());
+      assertEquals(2, store.getLastLogIndex());
+
+      assertTrue(store.getEntry(1).isEmpty());
+      assertTrue(store.getEntry(2).isEmpty());
+      assertTrue(store.getEntry(3).isEmpty());
+
+      assertEquals(1, store.getLastLogTerm());
+    }
+  }
+
+  @Test
+  void shouldInstallSnapshotBeyondLastLogIndex() {
+    try (RocksDbRaftLogStore store = open("install-snapshot-beyond-log-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two")));
+
+      store.installSnapshotBoundary(5, 3);
+
+      assertEquals(5, store.getLastIncludedIndex());
+      assertEquals(3, store.getLastIncludedTerm());
+      assertEquals(6, store.getFirstLogIndex());
+      assertEquals(5, store.getLastLogIndex());
+      assertEquals(3, store.getLastLogTerm());
+
+      assertTrue(store.getEntry(1).isEmpty());
+      assertTrue(store.getEntry(2).isEmpty());
+    }
+  }
+
+  @Test
+  void shouldRejectInstallingOlderSnapshotBoundary() {
+    try (RocksDbRaftLogStore store = open("install-older-snapshot-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 2, "three")));
+
+      store.compactPrefix(2, 1);
+
+      assertThrows(IllegalArgumentException.class, () -> store.installSnapshotBoundary(1, 1));
+
+      assertEquals(2, store.getLastIncludedIndex());
+      assertEquals(3, store.getLastLogIndex());
+      assertTrue(store.getEntry(3).isPresent());
+    }
+  }
+
+  @Test
+  void shouldAllowInstallingSameSnapshotBoundaryIdempotently() {
+    try (RocksDbRaftLogStore store = open("install-same-snapshot-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 2, "three")));
+
+      store.installSnapshotBoundary(2, 1);
+      store.installSnapshotBoundary(2, 1);
+
+      assertEquals(2, store.getLastIncludedIndex());
+      assertEquals(1, store.getLastIncludedTerm());
+      assertEquals(3, store.getLastLogIndex());
+      assertTrue(store.getEntry(3).isPresent());
+    }
+  }
+
+  @Test
+  void shouldRejectInstallingSameSnapshotIndexWithDifferentTerm() {
+    try (RocksDbRaftLogStore store = open("install-conflicting-snapshot-db")) {
+      store.appendAll(List.of(entry(1, 1, "one"), entry(2, 1, "two")));
+
+      store.installSnapshotBoundary(2, 1);
+
+      assertThrows(IllegalArgumentException.class, () -> store.installSnapshotBoundary(2, 2));
+
+      assertEquals(2, store.getLastIncludedIndex());
+      assertEquals(1, store.getLastIncludedTerm());
+    }
+  }
+
+  @Test
+  void shouldPersistInstalledSnapshotBoundaryAfterReopening() {
+    Path databasePath = tempDir.resolve("installed-snapshot-recovery-db");
+
+    try (RocksDbRaftLogStore store = RocksDbRaftLogStore.open(databasePath)) {
+      store.appendAll(
+          List.of(
+              entry(1, 1, "one"), entry(2, 1, "two"), entry(3, 2, "three"), entry(4, 2, "four")));
+
+      store.installSnapshotBoundary(2, 1);
+    }
+
+    try (RocksDbRaftLogStore reopened = RocksDbRaftLogStore.open(databasePath)) {
+      assertEquals(2, reopened.getLastIncludedIndex());
+      assertEquals(1, reopened.getLastIncludedTerm());
+      assertEquals(3, reopened.getFirstLogIndex());
+      assertEquals(4, reopened.getLastLogIndex());
+
+      assertTrue(reopened.getEntry(1).isEmpty());
+      assertTrue(reopened.getEntry(2).isEmpty());
+      assertTrue(reopened.getEntry(3).isPresent());
+      assertTrue(reopened.getEntry(4).isPresent());
+    }
+  }
+
   private RocksDbRaftLogStore open(String databaseName) {
     return RocksDbRaftLogStore.open(tempDir.resolve(databaseName));
   }

@@ -228,6 +228,61 @@ class AppendEntriesHandlerTests {
     assertEquals("old-two", payloadAt(2));
   }
 
+  @Test
+  void shouldRejectIncomingEntryAtSnapshotBoundary() {
+    prepareCompactedLog();
+
+    AppendEntriesResponse response =
+        handler.handle(request(2, 4, 1, List.of(entry(5, 2, "duplicate-five"))));
+
+    assertFalse(response.isSuccess());
+    assertEquals(5, logStore.getLastLogIndex());
+    assertEquals(5, logStore.getLastIncludedIndex());
+  }
+
+  @Test
+  void shouldRejectIncomingEntryBeforeSnapshotBoundary() {
+    prepareCompactedLog();
+
+    AppendEntriesResponse response =
+        handler.handle(request(2, 3, 1, List.of(entry(4, 1, "old-four"))));
+
+    assertFalse(response.isSuccess());
+    assertEquals(5, logStore.getLastLogIndex());
+    assertEquals(5, logStore.getLastIncludedIndex());
+  }
+
+  @Test
+  void shouldAppendEntryImmediatelyAfterSnapshotBoundary() {
+    prepareCompactedLog();
+
+    AppendEntriesResponse response = handler.handle(request(2, 5, 2, List.of(entry(6, 3, "six"))));
+
+    assertTrue(response.isSuccess());
+    assertEquals(6, logStore.getLastLogIndex());
+    assertEquals(5, logStore.getLastIncludedIndex());
+    assertEquals("six", payloadAt(6));
+  }
+
+  @Test
+  void shouldRejectRequestContainingEntryAtPreviousLogIndex() {
+    assertThrows(
+        IllegalArgumentException.class,
+        () -> request(2, 5, 2, List.of(entry(5, 2, "duplicate-five"))));
+  }
+
+  private void prepareCompactedLog() {
+    logStore.appendAll(
+        List.of(
+            entry(1, 1, "one"),
+            entry(2, 1, "two"),
+            entry(3, 1, "three"),
+            entry(4, 1, "four"),
+            entry(5, 2, "five")));
+
+    logStore.compactPrefix(5, 2);
+  }
+
   private AppendEntriesRequest request(
       long term, long previousIndex, long previousTerm, List<RaftLogEntry> entries) {
     return request(term, previousIndex, previousTerm, entries, 0);
@@ -271,6 +326,9 @@ class AppendEntriesHandlerTests {
 
     private final List<RaftLogEntry> entries = new ArrayList<>();
 
+    private long lastIncludedIndex;
+    private long lastIncludedTerm;
+
     @Override
     public synchronized void append(RaftLogEntry entry) {
       appendAll(List.of(entry));
@@ -279,37 +337,92 @@ class AppendEntriesHandlerTests {
     @Override
     public synchronized void appendAll(List<RaftLogEntry> newEntries) {
       for (RaftLogEntry entry : newEntries) {
-        if (entry.getIndex() != entries.size() + 1L) {
+        long expectedIndex = lastIncludedIndex + entries.size() + 1L;
+
+        if (entry.getIndex() != expectedIndex) {
           throw new IllegalArgumentException("Non-sequential log entry");
         }
+
         entries.add(entry);
       }
     }
 
     @Override
     public synchronized Optional<RaftLogEntry> getEntry(long index) {
-      if (index <= 0 || index > entries.size()) {
+      if (index <= lastIncludedIndex || index > getLastLogIndex()) {
         return Optional.empty();
       }
-      return Optional.of(entries.get((int) index - 1));
+
+      return Optional.of(entries.get((int) (index - lastIncludedIndex - 1)));
     }
 
     @Override
     public synchronized List<RaftLogEntry> getEntries(long fromIndex, long toIndex) {
-      if (fromIndex <= 0 || toIndex < fromIndex || toIndex > entries.size()) {
+      if (fromIndex <= lastIncludedIndex || toIndex < fromIndex || toIndex > getLastLogIndex()) {
         throw new IllegalArgumentException("Invalid log range");
       }
-      return List.copyOf(entries.subList((int) fromIndex - 1, (int) toIndex));
+
+      int start = (int) (fromIndex - lastIncludedIndex - 1);
+      int end = (int) (toIndex - lastIncludedIndex);
+
+      return List.copyOf(entries.subList(start, end));
     }
 
     @Override
     public synchronized long getLastLogIndex() {
-      return entries.size();
+      return lastIncludedIndex + entries.size();
     }
 
     @Override
     public synchronized long getLastLogTerm() {
-      return entries.isEmpty() ? 0 : entries.get(entries.size() - 1).getTerm();
+      if (entries.isEmpty()) {
+        return lastIncludedTerm;
+      }
+
+      return entries.get(entries.size() - 1).getTerm();
+    }
+
+    @Override
+    public synchronized long getLastIncludedIndex() {
+      return lastIncludedIndex;
+    }
+
+    @Override
+    public synchronized long getLastIncludedTerm() {
+      return lastIncludedTerm;
+    }
+
+    @Override
+    public synchronized Optional<Long> getTerm(long index) {
+      if (index == lastIncludedIndex && index > 0) {
+        return Optional.of(lastIncludedTerm);
+      }
+
+      if (index <= lastIncludedIndex) {
+        return Optional.empty();
+      }
+
+      return getEntry(index).map(RaftLogEntry::getTerm);
+    }
+
+    @Override
+    public synchronized void compactPrefix(long index, long term) {
+      if (index <= lastIncludedIndex || index > getLastLogIndex()) {
+        throw new IllegalArgumentException("Invalid snapshot boundary");
+      }
+
+      RaftLogEntry boundaryEntry = getEntry(index).orElseThrow();
+
+      if (boundaryEntry.getTerm() != term) {
+        throw new IllegalArgumentException("Snapshot boundary term mismatch");
+      }
+
+      int entriesToRemove = (int) (index - lastIncludedIndex);
+
+      entries.subList(0, entriesToRemove).clear();
+
+      lastIncludedIndex = index;
+      lastIncludedTerm = term;
     }
 
     @Override
@@ -322,11 +435,15 @@ class AppendEntriesHandlerTests {
 
     @Override
     public synchronized void replaceSuffix(long fromIndex, List<RaftLogEntry> replacements) {
-      if (fromIndex <= 0 || fromIndex > entries.size() + 1L) {
+
+      if (fromIndex <= lastIncludedIndex || fromIndex > getLastLogIndex() + 1L) {
         throw new IllegalArgumentException("Invalid replacement index");
       }
 
-      entries.subList((int) fromIndex - 1, entries.size()).clear();
+      int start = (int) (fromIndex - lastIncludedIndex - 1);
+
+      entries.subList(start, entries.size()).clear();
+
       appendAll(replacements);
     }
 

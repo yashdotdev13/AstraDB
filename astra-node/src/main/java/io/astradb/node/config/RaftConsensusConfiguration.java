@@ -11,6 +11,7 @@ import io.astradb.raft.election.RaftPeerClient;
 import io.astradb.raft.log.RocksDbRaftLogStore;
 import io.astradb.raft.rpc.AppendEntriesHandler;
 import io.astradb.raft.rpc.RequestVoteHandler;
+import io.astradb.raft.snapshot.RocksDbRaftSnapshotStore;
 import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import io.astradb.raft.state.RaftRole;
@@ -111,6 +112,7 @@ public class RaftConsensusConfiguration {
       RaftPeerClient raftPeerClient,
       ScheduledExecutorService raftScheduler,
       RaftCommitIndex raftCommitIndex,
+      RocksDbRaftSnapshotStore raftSnapshotStore,
       @Value("${astra.raft.heartbeat-interval-ms:50}") long heartbeatInterval) {
 
     return new RaftHeartbeatManager(
@@ -121,7 +123,8 @@ public class RaftConsensusConfiguration {
         raftPeerClient,
         raftScheduler,
         heartbeatInterval,
-        raftCommitIndex);
+        raftCommitIndex,
+        raftSnapshotStore);
   }
 
   @Bean(initMethod = "start", destroyMethod = "close")

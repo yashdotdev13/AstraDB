@@ -4,6 +4,9 @@ import io.astradb.common.time.HybridTimestamp;
 import io.astradb.storage.mvcc.TransactionId;
 import io.astradb.storage.mvcc.VersionChain;
 import io.astradb.storage.mvcc.VersionedValue;
+import io.astradb.storage.wal.LogSequenceNumber;
+import io.astradb.storage.wal.WalCheckpoint;
+import io.astradb.storage.wal.WalCheckpointStore;
 import io.astradb.storage.wal.WalManager;
 import io.astradb.storage.wal.WalRecord;
 import io.astradb.storage.wal.WalRecordType;
@@ -30,7 +33,7 @@ import org.rocksdb.RocksDBException;
  *   <li>Apply the transaction atomically to RocksDB.
  * </ol>
  *
- * <p>Committed WAL transactions are replayed during initialization.
+ * <p>Committed WAL transactions after the latest checkpoint are replayed during initialization.
  *
  * @param <K> key type
  * @param <V> value type
@@ -41,18 +44,22 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
   private final WalManager walManager;
   private final KeySerializer<K> keySerializer;
   private final ValueSerializer<V> valueSerializer;
+  private final WalCheckpointStore checkpointStore;
 
   private WalBackedRocksDbMvccStore(
       RocksDbMvccStore<K, V> store,
       WalManager walManager,
       KeySerializer<K> keySerializer,
-      ValueSerializer<V> valueSerializer) {
+      ValueSerializer<V> valueSerializer,
+      WalCheckpointStore checkpointStore) {
 
     this.store = Objects.requireNonNull(store, "Store must not be null");
     this.walManager = Objects.requireNonNull(walManager, "WAL manager must not be null");
     this.keySerializer = Objects.requireNonNull(keySerializer, "Key serializer must not be null");
     this.valueSerializer =
         Objects.requireNonNull(valueSerializer, "Value serializer must not be null");
+    this.checkpointStore =
+        Objects.requireNonNull(checkpointStore, "Checkpoint store must not be null");
   }
 
   /**
@@ -81,23 +88,66 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
     RocksDbMvccStore<K, V> store =
         RocksDbMvccStore.open(databasePath, keySerializer, valueSerializer);
 
-    WalManager walManager = new WalManager(walPath);
-
-    WalBackedRocksDbMvccStore<K, V> backedStore =
-        new WalBackedRocksDbMvccStore<>(store, walManager, keySerializer, valueSerializer);
+    WalManager walManager = null;
+    WalBackedRocksDbMvccStore<K, V> backedStore = null;
 
     try {
+      walManager = new WalManager(walPath);
+
+      Path checkpointPath =
+          walPath.resolveSibling(walPath.getFileName().toString() + ".checkpoint");
+
+      WalCheckpointStore checkpointStore = new WalCheckpointStore(checkpointPath);
+
+      backedStore =
+          new WalBackedRocksDbMvccStore<>(
+              store, walManager, keySerializer, valueSerializer, checkpointStore);
+
+      backedStore.restoreCheckpoint();
       backedStore.recover();
+
       return backedStore;
     } catch (RocksDBException | IOException | RuntimeException exception) {
-      try {
-        backedStore.close();
-      } catch (Exception closeException) {
-        exception.addSuppressed(closeException);
+      if (backedStore != null) {
+        try {
+          backedStore.close();
+        } catch (Exception closeException) {
+          exception.addSuppressed(closeException);
+        }
+      } else {
+        try {
+          store.close();
+        } catch (Exception closeException) {
+          exception.addSuppressed(closeException);
+        }
+
+        if (walManager != null) {
+          try {
+            walManager.close();
+          } catch (Exception closeException) {
+            exception.addSuppressed(closeException);
+          }
+        }
       }
 
       throw exception;
     }
+  }
+
+  /**
+   * Restores the latest persisted checkpoint, if one exists.
+   *
+   * @throws IOException if checkpoint loading fails
+   * @throws RocksDBException if snapshot restoration fails
+   */
+  private void restoreCheckpoint() throws IOException, RocksDBException {
+    Optional<WalCheckpoint> checkpoint = checkpointStore.load();
+
+    if (checkpoint.isEmpty()) {
+      return;
+    }
+
+    store.restoreSnapshot(checkpoint.get().getSnapshotData());
   }
 
   /**
@@ -116,9 +166,7 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
     Objects.requireNonNull(value, "Value must not be null");
     Objects.requireNonNull(timestamp, "Timestamp must not be null");
 
-    BatchOperation<K, V> operation = BatchOperation.put(key, value);
-
-    applyBatch(List.of(operation), timestamp);
+    applyBatch(List.of(BatchOperation.put(key, value)), timestamp);
   }
 
   /**
@@ -135,16 +183,11 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
     Objects.requireNonNull(key, "Key must not be null");
     Objects.requireNonNull(timestamp, "Timestamp must not be null");
 
-    BatchOperation<K, V> operation = BatchOperation.delete(key);
-
-    applyBatch(List.of(operation), timestamp);
+    applyBatch(List.of(BatchOperation.delete(key)), timestamp);
   }
 
   /**
    * Atomically applies multiple mutations using one WAL transaction and one RocksDB WriteBatch.
-   *
-   * <p>Duplicate keys are rejected because a single transaction timestamp cannot represent multiple
-   * versions of the same key.
    *
    * @param operations mutations to apply
    * @param timestamp transaction timestamp
@@ -163,8 +206,6 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
     }
 
     Set<K> uniqueKeys = new HashSet<>();
-
-    // Validate and serialize all operations before writing anything to the WAL.
     List<SerializedBatchOperation<K, V>> serializedOperations = new ArrayList<>(operations.size());
 
     for (BatchOperation<K, V> operation : operations) {
@@ -190,7 +231,6 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
 
     TransactionId transactionId = TransactionId.generate();
 
-    // WAL phase: persist the complete transaction before applying it to RocksDB.
     walManager.begin(transactionId, timestamp);
 
     for (SerializedBatchOperation<K, V> operation : serializedOperations) {
@@ -202,10 +242,8 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
       }
     }
 
-    // Commit forces the WAL before the RocksDB transaction is applied.
     walManager.commit(transactionId, timestamp);
 
-    // RocksDB phase: all mutations are applied atomically.
     store.applyBatch(operations, timestamp);
   }
 
@@ -218,7 +256,6 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
    * @throws RocksDBException if the read fails
    */
   public Optional<V> get(K key, HybridTimestamp snapshotTimestamp) throws RocksDBException {
-
     Objects.requireNonNull(key, "Key must not be null");
     Objects.requireNonNull(snapshotTimestamp, "Snapshot timestamp must not be null");
 
@@ -237,23 +274,25 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
   }
 
   /**
-   * Replays committed WAL transactions into RocksDB.
-   *
-   * <p>Uncommitted and aborted transactions are ignored. Each committed transaction is applied
-   * atomically. Repeated replay is safe because identical versions are skipped.
+   * Replays committed WAL transactions after the latest checkpoint.
    *
    * @throws IOException if WAL recovery fails
    * @throws RocksDBException if RocksDB application fails
    */
   private void recover() throws IOException, RocksDBException {
 
-    List<WalRecord> records = walManager.readAll();
+    long checkpointLsn =
+        checkpointStore
+            .load()
+            .map(checkpoint -> checkpoint.getLastIncludedLsn().getValue())
+            .orElse(0L);
+
+    List<WalRecord> records = walManager.readAllAfter(LogSequenceNumber.of(checkpointLsn));
 
     Map<TransactionId, List<WalRecord>> transactions = new HashMap<>();
     Set<TransactionId> committedTransactions = new HashSet<>();
     Set<TransactionId> abortedTransactions = new HashSet<>();
 
-    // Group records by transaction while identifying committed/aborted ones.
     for (WalRecord record : records) {
       TransactionId transactionId = record.getTransactionId();
 
@@ -266,9 +305,7 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
       }
     }
 
-    // Replay only committed transactions that were not aborted.
     for (Map.Entry<TransactionId, List<WalRecord>> entry : transactions.entrySet()) {
-
       TransactionId transactionId = entry.getKey();
 
       if (!committedTransactions.contains(transactionId)
@@ -280,7 +317,6 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
       HybridTimestamp transactionTimestamp = null;
 
       for (WalRecord record : entry.getValue()) {
-
         WalRecordType type = record.getType();
 
         if (type != WalRecordType.PUT && type != WalRecordType.DELETE) {
@@ -305,36 +341,28 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
         }
       }
 
-      if (operations.isEmpty()) {
-        continue;
+      if (!operations.isEmpty()) {
+        applyRecoveredBatch(operations, transactionTimestamp);
       }
-
-      applyRecoveredBatch(operations, transactionTimestamp);
     }
   }
 
-  /**
-   * Applies a recovered transaction atomically, skipping versions that already exist with identical
-   * contents.
-   */
+  /** Applies a recovered transaction atomically, skipping identical existing versions. */
   private void applyRecoveredBatch(List<BatchOperation<K, V>> operations, HybridTimestamp timestamp)
       throws RocksDBException {
 
     List<BatchOperation<K, V>> missingOperations = new ArrayList<>();
 
     for (BatchOperation<K, V> operation : operations) {
-
       K key = operation.getKey();
       VersionChain<V> chain = store.readVersionChainForKey(key);
 
       boolean tombstone = operation.getType() == BatchOperation.Type.DELETE;
       V value = tombstone ? null : operation.getValue();
 
-      if (containsIdenticalVersion(chain, timestamp, value, tombstone)) {
-        continue;
+      if (!containsIdenticalVersion(chain, timestamp, value, tombstone)) {
+        missingOperations.add(operation);
       }
-
-      missingOperations.add(operation);
     }
 
     if (!missingOperations.isEmpty()) {
@@ -351,7 +379,6 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
       VersionChain<V> chain, HybridTimestamp timestamp, V value, boolean tombstone) {
 
     for (VersionedValue<V> version : chain.getVersions()) {
-
       if (!version.getTimestamp().equals(timestamp)) {
         continue;
       }
@@ -380,12 +407,47 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
 
     private SerializedBatchOperation(
         BatchOperation.Type type, K key, byte[] serializedKey, byte[] serializedValue) {
-
       this.type = Objects.requireNonNull(type);
       this.key = Objects.requireNonNull(key);
       this.serializedKey = Objects.requireNonNull(serializedKey);
       this.serializedValue = serializedValue;
     }
+  }
+
+  /**
+   * Creates and persists a checkpoint of the current MVCC state.
+   *
+   * <p>Committed WAL transactions are recovered before the snapshot is exported. The checkpoint LSN
+   * identifies the last WAL record covered by the snapshot.
+   *
+   * <p>The WAL is intentionally not truncated.
+   *
+   * @throws IOException if WAL recovery or checkpoint persistence fails
+   * @throws RocksDBException if snapshot export or RocksDB flush fails
+   */
+  public synchronized void createCheckpoint() throws IOException, RocksDBException {
+
+    // Apply any committed transactions that have not yet reached RocksDB.
+    recover();
+
+    // Ensure the current storage state is flushed before checkpoint creation.
+    store.flush();
+    walManager.flush();
+
+    // Determine the highest WAL sequence number covered by this snapshot.
+    List<WalRecord> records = walManager.readAll();
+
+    long lastIncludedLsn =
+        records.stream().mapToLong(record -> record.getLsn().getValue()).max().orElse(0L);
+
+    // Export the complete MVCC state.
+    byte[] snapshotData = store.exportSnapshot();
+
+    // Persist the snapshot and its corresponding WAL boundary together.
+    WalCheckpoint checkpoint =
+        new WalCheckpoint(LogSequenceNumber.of(lastIncludedLsn), snapshotData);
+
+    checkpointStore.save(checkpoint);
   }
 
   /**
@@ -395,7 +457,6 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
    */
   @Override
   public synchronized void close() throws Exception {
-
     Exception failure = null;
 
     try {

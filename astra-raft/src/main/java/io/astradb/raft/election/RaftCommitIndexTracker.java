@@ -71,12 +71,11 @@ public final class RaftCommitIndexTracker {
 
     long candidateTerm =
         logStore
-            .getEntry(candidateCommitIndex)
-            .map(entry -> entry.getTerm())
+            .getTerm(candidateCommitIndex)
             .orElseThrow(
                 () ->
                     new IllegalStateException(
-                        "Missing log entry at candidate commit index " + candidateCommitIndex));
+                        "Missing log term at candidate commit index " + candidateCommitIndex));
 
     if (candidateTerm == nodeState.getCurrentTerm()) {
       commitIndex.advanceTo(candidateCommitIndex);
