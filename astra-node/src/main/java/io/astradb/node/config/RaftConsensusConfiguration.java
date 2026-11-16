@@ -1,17 +1,23 @@
 package io.astradb.node.config;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+import io.astradb.node.transport.HttpRaftPeerClient;
+import io.astradb.node.transport.RaftPeerAddressProvider;
 import io.astradb.raft.election.ElectionTimeout;
 import io.astradb.raft.election.RaftElectionConfig;
 import io.astradb.raft.election.RaftElectionCoordinator;
 import io.astradb.raft.election.RaftHeartbeatManager;
 import io.astradb.raft.election.RaftPeerClient;
 import io.astradb.raft.log.RocksDbRaftLogStore;
+import io.astradb.raft.rpc.AppendEntriesHandler;
+import io.astradb.raft.rpc.RequestVoteHandler;
 import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import io.astradb.raft.state.RaftRole;
+import java.net.http.HttpClient;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Set;
-import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.random.RandomGenerator;
@@ -42,27 +48,49 @@ public class RaftConsensusConfiguration {
         .collect(Collectors.toUnmodifiableSet());
   }
 
+  /** Configures and validates HTTP addresses for all configured Raft peers. */
+  @Bean
+  public RaftPeerAddressProvider raftPeerAddressProvider(
+      @Value("${astra.raft.peer-addresses:}") String configuredAddresses,
+      @Value("${astra.raft.node-id:node-1}") String localNodeId,
+      Set<String> raftPeerIds) {
+
+    if (raftPeerIds.contains(localNodeId)) {
+      throw new IllegalArgumentException(
+          "Local node ID must not be included in the Raft peer list: " + localNodeId);
+    }
+
+    RaftPeerAddressProvider provider = new RaftPeerAddressProvider(configuredAddresses);
+
+    for (String peerId : raftPeerIds) {
+      provider.getAddress(peerId);
+    }
+
+    return provider;
+  }
+
+  /** Creates the HTTP client used for inter-node Raft communication. */
+  @Bean
+  public HttpClient raftHttpClient(
+      @Value("${astra.raft.transport.connect-timeout-ms:500}") long connectTimeout) {
+
+    return HttpClient.newBuilder()
+        .connectTimeout(Duration.ofMillis(connectTimeout))
+        .version(HttpClient.Version.HTTP_1_1)
+        .build();
+  }
+
+  /** Configures the default asynchronous HTTP-based Raft peer client. */
   @Bean
   @ConditionalOnMissingBean(RaftPeerClient.class)
-  public RaftPeerClient raftPeerClient() {
-    return new RaftPeerClient() {
+  public RaftPeerClient raftPeerClient(
+      HttpClient raftHttpClient,
+      ObjectMapper objectMapper,
+      RaftPeerAddressProvider addressProvider,
+      @Value("${astra.raft.transport.request-timeout-ms:1000}") long requestTimeout) {
 
-      @Override
-      public CompletableFuture<io.astradb.raft.rpc.RequestVoteResponse> requestVote(
-          String peerId, io.astradb.raft.rpc.RequestVoteRequest request) {
-
-        return CompletableFuture.failedFuture(
-            new IllegalStateException("No Raft network transport configured for peer: " + peerId));
-      }
-
-      @Override
-      public CompletableFuture<io.astradb.raft.rpc.AppendEntriesResponse> appendEntries(
-          String peerId, io.astradb.raft.rpc.AppendEntriesRequest request) {
-
-        return CompletableFuture.failedFuture(
-            new IllegalStateException("No Raft network transport configured for peer: " + peerId));
-      }
-    };
+    return new HttpRaftPeerClient(
+        raftHttpClient, objectMapper, addressProvider, Duration.ofMillis(requestTimeout));
   }
 
   @Bean
@@ -124,5 +152,23 @@ public class RaftConsensusConfiguration {
             raftHeartbeatManager.stop();
           }
         });
+  }
+
+  @Bean
+  public RequestVoteHandler requestVoteHandler(
+      RaftNodeState raftNodeState, RocksDbRaftLogStore raftLogStore) {
+
+    return new RequestVoteHandler(raftNodeState, raftLogStore);
+  }
+
+  @Bean
+  public AppendEntriesHandler appendEntriesHandler(
+      RaftNodeState raftNodeState,
+      RocksDbRaftLogStore raftLogStore,
+      RaftElectionCoordinator raftElectionCoordinator,
+      RaftCommitIndex raftCommitIndex) {
+
+    return new AppendEntriesHandler(
+        raftNodeState, raftLogStore, raftElectionCoordinator, raftCommitIndex);
   }
 }

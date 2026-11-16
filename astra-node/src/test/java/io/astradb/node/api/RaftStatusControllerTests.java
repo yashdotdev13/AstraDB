@@ -4,6 +4,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import io.astradb.node.RaftStatusController;
 import io.astradb.raft.metadata.RaftMetadata;
 import io.astradb.raft.metadata.RaftMetadataStore;
 import io.astradb.raft.state.RaftCommitIndex;

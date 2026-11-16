@@ -1,4 +1,4 @@
-package io.astradb.node.api;
+package io.astradb.node;
 
 import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
