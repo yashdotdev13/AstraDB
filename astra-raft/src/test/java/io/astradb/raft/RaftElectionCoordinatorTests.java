@@ -175,6 +175,21 @@ class RaftElectionCoordinatorTests {
         () -> new RaftElectionCoordinator("node-1", Set.of(" "), nodeState, logStore, peerClient));
   }
 
+  @Test
+  void shouldStepDownWhenPreviousElectionResponseReportsHigherTerm() {
+    coordinator.startElection();
+
+    CompletableFuture<RequestVoteResponse> oldRequest = peerClient.requests.get("node-2");
+
+    coordinator.startElection();
+
+    oldRequest.complete(new RequestVoteResponse(3, false));
+
+    assertEquals(3, nodeState.getCurrentTerm());
+    assertEquals(RaftRole.FOLLOWER, nodeState.getRole());
+    assertTrue(nodeState.getVotedFor().isEmpty());
+  }
+
   private static final class FakePeerClient implements RaftPeerClient {
 
     private final Map<String, CompletableFuture<RequestVoteResponse>> requests = new HashMap<>();

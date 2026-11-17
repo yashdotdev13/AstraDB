@@ -185,7 +185,7 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
   private synchronized void handleVoteResponse(
       ElectionContext context, String peerId, RequestVoteResponse response, Throwable error) {
 
-    if (closed || activeElection != context) {
+    if (closed || context.stopped) {
       return;
     }
 
@@ -194,11 +194,14 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
     }
 
     if (error != null || response == null) {
-      recordRejectedVote(context, peerId);
+      if (activeElection == context) {
+        recordRejectedVote(context, peerId);
+      }
       return;
     }
 
-    // A higher-term response requires an immediate step-down.
+    // A higher-term response requires an immediate step-down,
+    // even if it belongs to a previous election.
     if (response.getTerm() > nodeState.getCurrentTerm()) {
       RaftRole previousRole = nodeState.getRole();
 
@@ -208,11 +211,18 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
         notifyRoleChange(nodeState.getRole());
       }
 
-      finishElectionAndReschedule(context);
+      ElectionContext currentElection = activeElection;
+      if (currentElection != null) {
+        finishElectionAndReschedule(currentElection);
+      }
       return;
     }
 
     // Ignore responses if this election is no longer current.
+    if (activeElection != context) {
+      return;
+    }
+
     if (nodeState.getCurrentTerm() != context.term || nodeState.getRole() != RaftRole.CANDIDATE) {
       return;
     }
@@ -311,7 +321,12 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
   /** Stops automatic election scheduling and invalidates the active election. */
   public synchronized void stop() {
     started = false;
-    activeElection = null;
+
+    if (activeElection != null) {
+      activeElection.stopped = true;
+      activeElection = null;
+    }
+
     cancelElectionTimeout();
   }
 
@@ -344,6 +359,7 @@ public final class RaftElectionCoordinator implements AutoCloseable, ElectionTim
 
     private final long term;
     private final VoteCounter voteCounter;
+    private boolean stopped;
 
     private ElectionContext(long term, VoteCounter voteCounter) {
       this.term = term;
