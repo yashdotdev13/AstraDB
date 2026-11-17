@@ -14,6 +14,7 @@ import io.astradb.raft.rpc.InstallSnapshotRequest;
 import io.astradb.raft.rpc.InstallSnapshotResponse;
 import io.astradb.raft.rpc.RequestVoteRequest;
 import io.astradb.raft.rpc.RequestVoteResponse;
+import io.astradb.raft.state.RaftCommitIndex;
 import io.astradb.raft.state.RaftNodeState;
 import io.astradb.raft.state.RaftRole;
 import java.util.ArrayList;
@@ -368,6 +369,25 @@ class RaftHeartbeatManagerTests {
   private void becomeLeader() {
     nodeState.startElection("node-1");
     nodeState.becomeLeader();
+  }
+
+  @Test
+  void shouldCommitEntriesImmediatelyInSingleNodeCluster() {
+    RaftCommitIndex commitIndex = new RaftCommitIndex();
+
+    RaftHeartbeatManager singleNodeManager =
+        new RaftHeartbeatManager(
+            "node-1", Set.of(), nodeState, logStore, peerClient, scheduler, 100, commitIndex);
+
+    logStore.append(entry(1, 1, "single-node-entry"));
+
+    singleNodeManager.start();
+    singleNodeManager.sendHeartbeats();
+
+    assertEquals(1, commitIndex.getCommitIndex());
+    assertTrue(peerClient.requests.isEmpty());
+
+    singleNodeManager.close();
   }
 
   private RaftLogEntry entry(long index, long term, String payload) {
