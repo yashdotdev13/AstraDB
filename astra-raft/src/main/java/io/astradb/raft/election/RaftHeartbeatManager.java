@@ -306,6 +306,8 @@ public final class RaftHeartbeatManager implements AutoCloseable {
 
     long term = nodeState.getCurrentTerm();
 
+    advanceCommitIndex();
+
     for (String peerId : peerIds) {
       try {
         sendAppendEntries(peerId, term);
