@@ -1,5 +1,6 @@
 package io.astradb.transaction;
 
+import io.astradb.common.time.HybridTimestamp;
 import io.astradb.common.time.TimestampOracle;
 import io.astradb.storage.mvcc.Snapshot;
 import io.astradb.storage.mvcc.SnapshotManager;
@@ -33,6 +34,13 @@ public final class TransactionManager<K, V> {
   private final ConcurrentMap<TransactionId, Transaction<K, V>> activeTransactions =
       new ConcurrentHashMap<>();
 
+  /**
+   * Creates a transaction manager using the supplied storage and snapshot infrastructure.
+   *
+   * @param store WAL-backed MVCC storage
+   * @param timestampOracle source of hybrid timestamps
+   * @param snapshotManager manager for active transaction snapshots
+   */
   public TransactionManager(
       WalBackedRocksDbMvccStore<K, V> store,
       TimestampOracle timestampOracle,
@@ -119,16 +127,29 @@ public final class TransactionManager<K, V> {
         }
       }
 
+      HybridTimestamp commitTimestamp;
+
       try {
-        store.applyBatch(operations, timestampOracle.now());
-        transaction.markCommitted();
+        commitTimestamp = timestampOracle.now();
+      } catch (RuntimeException exception) {
+        transaction.markAborted();
         complete(transactionId);
+
+        throw new TransactionException(
+            "Failed to obtain commit timestamp for transaction: " + transactionId, exception);
+      }
+
+      try {
+        store.applyBatch(operations, commitTimestamp);
       } catch (RocksDBException | IOException | RuntimeException exception) {
         transaction.markInDoubt();
 
         throw new TransactionException(
             "Transaction commit outcome is uncertain: " + transactionId, exception);
       }
+
+      transaction.markCommitted();
+      complete(transactionId);
     }
   }
 

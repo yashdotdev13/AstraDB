@@ -5,6 +5,7 @@ import java.util.Objects;
 /** Represents a mutation staged by an active transaction. */
 public final class PendingMutation<K, V> {
 
+  /** Supported mutation operations. */
   public enum Type {
     PUT,
     DELETE
