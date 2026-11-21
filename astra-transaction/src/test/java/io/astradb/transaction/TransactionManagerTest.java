@@ -310,26 +310,36 @@ class TransactionManagerTest {
     CountDownLatch start = new CountDownLatch(1);
 
     try (ExecutorService executor = Executors.newFixedThreadPool(2)) {
-      Future<?> first =
+      Future<Boolean> first =
           executor.submit(
               () -> {
                 await(start);
-                transactionManager.commit(transaction.getId());
+                try {
+                  transactionManager.commit(transaction.getId());
+                  return true;
+                } catch (TransactionException exception) {
+                  return false;
+                }
               });
 
-      Future<?> second =
+      Future<Boolean> second =
           executor.submit(
               () -> {
                 await(start);
-                assertThrows(
-                    TransactionException.class,
-                    () -> transactionManager.commit(transaction.getId()));
+                try {
+                  transactionManager.commit(transaction.getId());
+                  return true;
+                } catch (TransactionException exception) {
+                  return false;
+                }
               });
 
       start.countDown();
 
-      first.get(5, TimeUnit.SECONDS);
-      second.get(5, TimeUnit.SECONDS);
+      boolean firstSucceeded = first.get(5, TimeUnit.SECONDS);
+      boolean secondSucceeded = second.get(5, TimeUnit.SECONDS);
+
+      assertTrue(firstSucceeded ^ secondSucceeded);
     }
 
     assertEquals(TransactionState.COMMITTED, transaction.getState());
