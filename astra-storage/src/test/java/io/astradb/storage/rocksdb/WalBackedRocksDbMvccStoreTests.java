@@ -2,10 +2,12 @@ package io.astradb.storage.rocksdb;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import io.astradb.common.time.HybridTimestamp;
 import java.nio.file.Path;
+import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
@@ -160,6 +162,66 @@ class WalBackedRocksDbMvccStoreTests {
     try (WalBackedRocksDbMvccStore<String, String> reopenedStore = openStore()) {
 
       assertEquals(unicodeValue, reopenedStore.get(unicodeKey, timestamp(1)).orElseThrow());
+    }
+  }
+
+  @Test
+  void shouldScanAllVisibleEntries() throws Exception {
+    try (WalBackedRocksDbMvccStore<String, String> store = openStore()) {
+      store.put("name", "AstraDB", timestamp(1));
+      store.put("language", "Java", timestamp(2));
+      store.put("storage", "RocksDB", timestamp(3));
+
+      assertEquals(
+          Map.of(
+              "name", "AstraDB",
+              "language", "Java",
+              "storage", "RocksDB"),
+          store.scan(timestamp(10)));
+    }
+  }
+
+  @Test
+  void shouldRespectSnapshotVisibilityDuringScan() throws Exception {
+    try (WalBackedRocksDbMvccStore<String, String> store = openStore()) {
+      store.put("key-1", "v1", timestamp(1));
+      store.put("key-1", "v2", timestamp(3));
+      store.put("key-2", "value-2", timestamp(2));
+
+      assertEquals(Map.of("key-1", "v1", "key-2", "value-2"), store.scan(timestamp(2)));
+
+      assertEquals(Map.of("key-1", "v2", "key-2", "value-2"), store.scan(timestamp(5)));
+    }
+  }
+
+  @Test
+  void shouldExcludeDeletedEntriesDuringScan() throws Exception {
+    try (WalBackedRocksDbMvccStore<String, String> store = openStore()) {
+      store.put("active-key", "active-value", timestamp(1));
+      store.put("deleted-key", "deleted-value", timestamp(2));
+      store.delete("deleted-key", timestamp(3));
+
+      assertEquals(
+          Map.of(
+              "active-key", "active-value",
+              "deleted-key", "deleted-value"),
+          store.scan(timestamp(2)));
+
+      assertEquals(Map.of("active-key", "active-value"), store.scan(timestamp(4)));
+    }
+  }
+
+  @Test
+  void shouldReturnEmptyMapWhenScanningEmptyStore() throws Exception {
+    try (WalBackedRocksDbMvccStore<String, String> store = openStore()) {
+      assertTrue(store.scan(timestamp(1)).isEmpty());
+    }
+  }
+
+  @Test
+  void shouldRejectNullTimestampDuringScan() throws Exception {
+    try (WalBackedRocksDbMvccStore<String, String> store = openStore()) {
+      assertThrows(NullPointerException.class, () -> store.scan(null));
     }
   }
 }
