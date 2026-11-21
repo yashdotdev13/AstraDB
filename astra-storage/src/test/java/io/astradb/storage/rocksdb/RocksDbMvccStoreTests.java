@@ -4,6 +4,7 @@ import static org.junit.jupiter.api.Assertions.*;
 
 import io.astradb.common.time.HybridTimestamp;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -173,6 +174,74 @@ class RocksDbMvccStoreTests {
             store.get("shared-key", timestamp(i)),
             "Version at timestamp " + i + " should be visible");
       }
+    }
+  }
+
+  @Test
+  void shouldScanAllVisibleEntries() throws RocksDBException {
+    try (RocksDbMvccStore<String, String> store = openStore(tempDir.resolve("scan-db"))) {
+      store.put("name", "AstraDB", timestamp(100));
+      store.put("language", "Java", timestamp(110));
+      store.put("database", "RocksDB", timestamp(120));
+
+      assertEquals(
+          Map.of(
+              "name", "AstraDB",
+              "language", "Java",
+              "database", "RocksDB"),
+          store.scan(timestamp(150)));
+    }
+  }
+
+  @Test
+  void shouldRespectSnapshotVisibilityDuringScan() throws RocksDBException {
+    try (RocksDbMvccStore<String, String> store = openStore(tempDir.resolve("scan-history-db"))) {
+      store.put("key-1", "v1", timestamp(100));
+      store.put("key-1", "v2", timestamp(200));
+      store.put("key-2", "value-2", timestamp(150));
+
+      assertEquals(
+          Map.of(
+              "key-1", "v1",
+              "key-2", "value-2"),
+          store.scan(timestamp(175)));
+
+      assertEquals(
+          Map.of(
+              "key-1", "v2",
+              "key-2", "value-2"),
+          store.scan(timestamp(250)));
+    }
+  }
+
+  @Test
+  void shouldExcludeDeletedEntriesDuringScan() throws RocksDBException {
+    try (RocksDbMvccStore<String, String> store = openStore(tempDir.resolve("scan-delete-db"))) {
+      store.put("active-key", "active-value", timestamp(100));
+      store.put("deleted-key", "deleted-value", timestamp(110));
+      store.delete("deleted-key", timestamp(200));
+
+      assertEquals(
+          Map.of(
+              "active-key", "active-value",
+              "deleted-key", "deleted-value"),
+          store.scan(timestamp(150)));
+
+      assertEquals(Map.of("active-key", "active-value"), store.scan(timestamp(250)));
+    }
+  }
+
+  @Test
+  void shouldReturnEmptyMapWhenScanningEmptyStore() throws RocksDBException {
+    try (RocksDbMvccStore<String, String> store = openStore(tempDir.resolve("empty-scan-db"))) {
+      assertTrue(store.scan(timestamp(100)).isEmpty());
+    }
+  }
+
+  @Test
+  void shouldRejectNullTimestampDuringScan() throws RocksDBException {
+    try (RocksDbMvccStore<String, String> store = openStore(tempDir.resolve("null-scan-db"))) {
+      assertThrows(NullPointerException.class, () -> store.scan(null));
     }
   }
 }

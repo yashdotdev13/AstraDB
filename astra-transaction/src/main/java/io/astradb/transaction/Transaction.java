@@ -4,11 +4,7 @@ import io.astradb.storage.mvcc.Snapshot;
 import io.astradb.storage.mvcc.TransactionId;
 import io.astradb.storage.rocksdb.WalBackedRocksDbMvccStore;
 import io.astradb.transaction.mutation.PendingMutation;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.Objects;
-import java.util.Optional;
+import java.util.*;
 import org.rocksdb.RocksDBException;
 
 /**
@@ -98,6 +94,34 @@ public final class Transaction<K, V> {
       return store.get(key, snapshot.getTimestamp());
     } catch (RocksDBException exception) {
       throw new TransactionException("Failed to read key within transaction: " + id, exception);
+    }
+  }
+
+  /**
+   * Scans all values visible to the transaction using read-your-writes semantics.
+   *
+   * <p>The transaction's snapshot determines the initially visible entries. Pending mutations are
+   * then applied so that staged writes are included and staged deletions are excluded.
+   *
+   * @return immutable map of visible key-value entries
+   */
+  public synchronized Map<K, V> scan() {
+    ensureActive();
+
+    try {
+      Map<K, V> visibleEntries = new LinkedHashMap<>(store.scan(snapshot.getTimestamp()));
+
+      for (PendingMutation<K, V> mutation : pendingMutations.values()) {
+        if (mutation.isDelete()) {
+          visibleEntries.remove(mutation.getKey());
+        } else {
+          visibleEntries.put(mutation.getKey(), mutation.getValue());
+        }
+      }
+
+      return Collections.unmodifiableMap(visibleEntries);
+    } catch (RocksDBException exception) {
+      throw new TransactionException("Failed to scan entries within transaction: " + id, exception);
     }
   }
 

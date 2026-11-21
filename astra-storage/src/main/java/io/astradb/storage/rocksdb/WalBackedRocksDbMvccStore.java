@@ -451,6 +451,19 @@ public final class WalBackedRocksDbMvccStore<K, V> implements AutoCloseable {
   }
 
   /**
+   * Reads all values visible to the specified snapshot.
+   *
+   * @param snapshotTimestamp snapshot timestamp
+   * @return immutable map of visible key-value entries
+   * @throws RocksDBException if the scan fails
+   */
+  public Map<K, V> scan(HybridTimestamp snapshotTimestamp) throws RocksDBException {
+    Objects.requireNonNull(snapshotTimestamp, "Snapshot timestamp must not be null");
+
+    return store.scan(snapshotTimestamp);
+  }
+
+  /**
    * Closes RocksDB and the WAL manager.
    *
    * @throws Exception if closing either resource fails

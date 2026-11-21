@@ -9,12 +9,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.file.Path;
-import java.util.ArrayList;
-import java.util.Base64;
-import java.util.HashSet;
-import java.util.List;
-import java.util.Objects;
-import java.util.Set;
+import java.util.*;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.rocksdb.RocksDBException;
@@ -177,6 +172,42 @@ public final class RocksDbMvccStore<K, V> implements AutoCloseable {
       } finally {
         lock.unlock();
       }
+    } finally {
+      snapshotLock.readLock().unlock();
+    }
+  }
+
+  /**
+   * Returns all key-value entries visible at the specified snapshot timestamp.
+   *
+   * <p>Entries are evaluated using their MVCC version chains. Keys that are not visible or have
+   * been deleted at the snapshot timestamp are excluded.
+   *
+   * @param snapshotTimestamp snapshot timestamp
+   * @return immutable map of visible key-value entries
+   * @throws RocksDBException if reading RocksDB fails
+   */
+  public Map<K, V> scan(HybridTimestamp snapshotTimestamp) throws RocksDBException {
+    Objects.requireNonNull(snapshotTimestamp, "Snapshot timestamp must not be null");
+
+    snapshotLock.readLock().lock();
+
+    try {
+      Map<K, V> visibleEntries = new LinkedHashMap<>();
+
+      for (RocksDbEntry entry : rocksDbStore.readAll()) {
+        K key =
+            Objects.requireNonNull(
+                keySerializer.deserialize(entry.getKey()), "Deserialized key must not be null");
+
+        VersionChain<V> chain = versionChainSerializer.deserialize(entry.getValue());
+
+        Optional<V> visibleValue = chain.get(snapshotTimestamp);
+
+        visibleValue.ifPresent(value -> visibleEntries.put(key, value));
+      }
+
+      return Collections.unmodifiableMap(visibleEntries);
     } finally {
       snapshotLock.readLock().unlock();
     }
