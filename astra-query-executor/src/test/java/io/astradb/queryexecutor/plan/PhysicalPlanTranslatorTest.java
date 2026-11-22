@@ -347,6 +347,61 @@ class PhysicalPlanTranslatorTest {
                     row.getValue(0).equals(new BigDecimal("30")) && row.getValue(1).equals("Bob")));
   }
 
+  @Test
+  void shouldExecuteArithmeticAdditionInWherePredicate() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan = sqlPlanner.plan("SELECT name FROM users WHERE id + 10 > 20", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(2, results.size());
+    assertTrue(results.stream().anyMatch(row -> "Charlie".equals(row.getValue(0))));
+    assertTrue(results.stream().anyMatch(row -> "Bob".equals(row.getValue(0))));
+  }
+
+  @Test
+  void shouldExecuteArithmeticMultiplicationInWherePredicate() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan = sqlPlanner.plan("SELECT name FROM users WHERE id * 2 >= 30", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(2, results.size());
+    assertTrue(results.stream().anyMatch(row -> "Charlie".equals(row.getValue(0))));
+    assertTrue(results.stream().anyMatch(row -> "Bob".equals(row.getValue(0))));
+  }
+
+  @Test
+  void shouldExecuteArithmeticSubtractionInWherePredicate() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan = sqlPlanner.plan("SELECT name FROM users WHERE id - 5 = 10", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(1, results.size());
+    assertEquals("Bob", results.get(0).getValue(0));
+  }
+
+  @Test
+  void shouldExecuteArithmeticDivisionInWherePredicate() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan = sqlPlanner.plan("SELECT name FROM users WHERE id / 5 >= 3", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(2, results.size());
+    assertTrue(results.stream().anyMatch(row -> "Charlie".equals(row.getValue(0))));
+    assertTrue(results.stream().anyMatch(row -> "Bob".equals(row.getValue(0))));
+  }
+
   private record PhysicalOperatorHolder(
       io.astradb.queryexecutor.operator.PhysicalOperator operator) {}
 }
