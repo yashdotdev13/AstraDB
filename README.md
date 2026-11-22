@@ -1,16 +1,14 @@
 # AstraDB
 
-```{=html}
-<p align="left">
-```
-`<img src="https://img.shields.io/badge/Java-21-orange?logo=openjdk&logoColor=white" alt="Java 21" />`{=html}
-`<img src="https://img.shields.io/badge/Build-Maven-C71A36?logo=apachemaven&logoColor=white" alt="Maven" />`{=html}
-`<img src="https://img.shields.io/badge/SQL%20Planning-Apache%20Calcite-2E6E9E" alt="Apache Calcite" />`{=html}
-`<img src="https://img.shields.io/badge/Storage-RocksDB-4B6F9C" alt="RocksDB" />`{=html}
-`<img src="https://img.shields.io/badge/Project-In%20Development-yellow" alt="Project in development" />`{=html}
-```{=html}
-</p>
-```
+[![Java
+21](https://img.shields.io/badge/Java-21-orange?logo=openjdk&logoColor=white)](https://openjdk.org/)
+[![Maven](https://img.shields.io/badge/Build-Maven-C71A36?logo=apachemaven&logoColor=white)](https://maven.apache.org/)
+[![Apache
+Calcite](https://img.shields.io/badge/SQL_Planning-Apache_Calcite-2E6E9E)](https://calcite.apache.org/)
+[![RocksDB](https://img.shields.io/badge/Storage-RocksDB-4B6F9C)](https://rocksdb.org/)
+[![Project
+Status](https://img.shields.io/badge/Project-In_Development-yellow)](#)
+
 AstraDB is a distributed SQL database built in Java. It brings together
 core database components such as SQL planning and execution,
 transactional storage, replication, and distributed coordination.
