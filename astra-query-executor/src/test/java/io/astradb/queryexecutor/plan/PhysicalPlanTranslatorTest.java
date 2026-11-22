@@ -402,6 +402,95 @@ class PhysicalPlanTranslatorTest {
     assertTrue(results.stream().anyMatch(row -> "Bob".equals(row.getValue(0))));
   }
 
+  @Test
+  void shouldInspectCalciteAggregatePlans() {
+    SqlPlan groupedPlan =
+        sqlPlanner.plan("SELECT name, COUNT(*), SUM(id) FROM users GROUP BY name", schema);
+
+    SqlPlan globalPlan =
+        sqlPlanner.plan("SELECT COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM users", schema);
+
+    System.out.println("\n===== GROUPED AGGREGATION PLAN =====");
+    System.out.println(
+        org.apache.calcite.plan.RelOptUtil.toString(groupedPlan.logicalPlan().orElseThrow()));
+
+    System.out.println("\n===== GLOBAL AGGREGATION PLAN =====");
+    System.out.println(
+        org.apache.calcite.plan.RelOptUtil.toString(globalPlan.logicalPlan().orElseThrow()));
+  }
+
+  @Test
+  void shouldExecuteGlobalAggregation() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan =
+        sqlPlanner.plan("SELECT COUNT(*), SUM(id), AVG(id), MIN(id), MAX(id) FROM users", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(1, results.size());
+
+    RelationalRow result = results.get(0);
+
+    assertEquals(5, result.size());
+    assertEquals(3L, result.getValue(0));
+    assertEquals(new BigDecimal("45"), result.getValue(1));
+    assertEquals(new BigDecimal("15"), result.getValue(2));
+    assertEquals(5, result.getValue(3));
+    assertEquals(25, result.getValue(4));
+  }
+
+  @Test
+  void shouldExecuteGroupedAggregation() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan =
+        sqlPlanner.plan("SELECT name, COUNT(*), SUM(id) FROM users GROUP BY name", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(3, results.size());
+
+    assertTrue(
+        results.stream()
+            .anyMatch(
+                row ->
+                    "Charlie".equals(row.getValue(0))
+                        && row.getValue(1).equals(1L)
+                        && row.getValue(2).equals(new BigDecimal("25"))));
+
+    assertTrue(
+        results.stream()
+            .anyMatch(
+                row ->
+                    "Alice".equals(row.getValue(0))
+                        && row.getValue(1).equals(1L)
+                        && row.getValue(2).equals(new BigDecimal("5"))));
+
+    assertTrue(
+        results.stream()
+            .anyMatch(
+                row ->
+                    "Bob".equals(row.getValue(0))
+                        && row.getValue(1).equals(1L)
+                        && row.getValue(2).equals(new BigDecimal("15"))));
+  }
+
+  @Test
+  void shouldExecuteCountColumnAggregation() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan = sqlPlanner.plan("SELECT COUNT(name) FROM users", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(1, results.size());
+    assertEquals(3L, results.get(0).getValue(0));
+  }
+
   private record PhysicalOperatorHolder(
       io.astradb.queryexecutor.operator.PhysicalOperator operator) {}
 }
