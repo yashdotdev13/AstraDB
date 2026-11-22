@@ -14,6 +14,7 @@ import io.astradb.storage.rocksdb.StringValueSerializer;
 import io.astradb.storage.rocksdb.WalBackedRocksDbMvccStore;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
+import java.util.Map;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -424,5 +425,96 @@ class TransactionManagerTest {
       Thread.currentThread().interrupt();
       throw new IllegalStateException("Concurrent operation was interrupted", exception);
     }
+  }
+
+  @Test
+  void shouldScanSnapshotVisibleEntries() throws Exception {
+    store.put("user:1", "Alice", timestampOracle.now());
+    store.put("user:2", "Bob", timestampOracle.now());
+    store.put("user:3", "Charlie", timestampOracle.now());
+
+    Transaction<String, String> transaction = transactionManager.begin();
+
+    assertEquals(
+        Map.of(
+            "user:1", "Alice",
+            "user:2", "Bob",
+            "user:3", "Charlie"),
+        transaction.scan());
+
+    transactionManager.rollback(transaction.getId());
+  }
+
+  @Test
+  void shouldIncludePendingWritesInScan() throws Exception {
+    store.put("user:1", "Alice", timestampOracle.now());
+
+    Transaction<String, String> transaction = transactionManager.begin();
+
+    transaction.put("user:1", "Alicia");
+    transaction.put("user:2", "Bob");
+
+    assertEquals(
+        Map.of(
+            "user:1", "Alicia",
+            "user:2", "Bob"),
+        transaction.scan());
+
+    transactionManager.rollback(transaction.getId());
+  }
+
+  @Test
+  void shouldExcludePendingDeletesFromScan() throws Exception {
+    store.put("user:1", "Alice", timestampOracle.now());
+    store.put("user:2", "Bob", timestampOracle.now());
+    store.put("user:3", "Charlie", timestampOracle.now());
+
+    Transaction<String, String> transaction = transactionManager.begin();
+
+    transaction.delete("user:2");
+
+    assertEquals(
+        Map.of(
+            "user:1", "Alice",
+            "user:3", "Charlie"),
+        transaction.scan());
+
+    transactionManager.rollback(transaction.getId());
+  }
+
+  @Test
+  void shouldUseLatestPendingMutationDuringScan() throws Exception {
+    store.put("user:1", "Alice", timestampOracle.now());
+
+    Transaction<String, String> transaction = transactionManager.begin();
+
+    transaction.put("user:1", "Alicia");
+    transaction.put("user:1", "Alex");
+
+    assertEquals(Map.of("user:1", "Alex"), transaction.scan());
+
+    transactionManager.rollback(transaction.getId());
+  }
+
+  @Test
+  void shouldRejectScanAfterCommit() {
+    Transaction<String, String> transaction = transactionManager.begin();
+
+    transactionManager.commit(transaction.getId());
+
+    assertThrows(TransactionException.class, transaction::scan);
+  }
+
+  @Test
+  void shouldReturnImmutableScanResult() throws Exception {
+    Transaction<String, String> transaction = transactionManager.begin();
+
+    transaction.put("user:1", "Alice");
+
+    Map<String, String> result = transaction.scan();
+
+    assertThrows(UnsupportedOperationException.class, () -> result.put("user:2", "Bob"));
+
+    transactionManager.rollback(transaction.getId());
   }
 }
