@@ -15,6 +15,7 @@ import java.util.List;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.core.TableScan;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -144,5 +145,101 @@ class SqlPlannerTest {
 
     assertTrue(logicalPlan instanceof Project);
     assertTrue(logicalPlan.getInputs().stream().noneMatch(Filter.class::isInstance));
+  }
+
+  @Test
+  void shouldPrintLogicalPlanStructureForPhysicalTranslation() {
+    SqlPlan plan = planner.plan("SELECT name FROM users WHERE id > 10", schema);
+
+    RelNode logicalPlan = plan.logicalPlan().orElseThrow();
+
+    System.out.println("\n===== ASTRA DB LOGICAL PLAN =====");
+    System.out.println(new SqlPlanExplainer().explain(plan));
+
+    System.out.println("\n===== TABLE SCAN DETAILS =====");
+
+    RelNode scanNode = logicalPlan;
+
+    while (!(scanNode instanceof TableScan)) {
+      if (scanNode.getInputs().isEmpty()) {
+        throw new IllegalStateException("No TableScan found in logical plan");
+      }
+
+      scanNode = scanNode.getInput(0);
+    }
+
+    TableScan tableScan = (TableScan) scanNode;
+
+    System.out.println("Scan class: " + tableScan.getClass().getName());
+    System.out.println("Qualified name: " + tableScan.getTable().getQualifiedName());
+    System.out.println("Scan row type: " + tableScan.getRowType());
+    System.out.println("Table object: " + tableScan.getTable().getClass().getName());
+
+    System.out.println("\n===== RELATIONAL NODE DETAILS =====");
+
+    RelNode current = logicalPlan;
+
+    while (true) {
+      System.out.println("\nNode: " + current.getClass().getName());
+      System.out.println("Inputs: " + current.getInputs().size());
+      System.out.println("Row type: " + current.getRowType());
+
+      if (current instanceof TableScan tableScanNode) {
+        System.out.println("Qualified table name: " + tableScanNode.getTable().getQualifiedName());
+      }
+
+      if (current.getInputs().isEmpty()) {
+        break;
+      }
+
+      current = current.getInput(0);
+    }
+  }
+
+  @Test
+  void shouldPrintSortPlanStructureForPhysicalTranslation() {
+    SqlPlan plan = planner.plan("SELECT name FROM users WHERE id > 10 ORDER BY id ASC", schema);
+
+    RelNode logicalPlan = plan.logicalPlan().orElseThrow();
+
+    System.out.println("\n===== ORDER BY LOGICAL PLAN =====");
+    System.out.println(new SqlPlanExplainer().explain(plan));
+
+    System.out.println("\n===== SORT NODE DETAILS =====");
+
+    RelNode current = logicalPlan;
+
+    while (true) {
+      System.out.println("\nNode: " + current.getClass().getName());
+      System.out.println("Row type: " + current.getRowType());
+
+      if (current instanceof org.apache.calcite.rel.core.Sort sort) {
+        System.out.println("Collation: " + sort.getCollation());
+        System.out.println("Field collations: " + sort.getCollation().getFieldCollations());
+        System.out.println("Offset: " + sort.offset);
+        System.out.println("Fetch: " + sort.fetch);
+      }
+
+      if (current.getInputs().isEmpty()) {
+        break;
+      }
+
+      current = current.getInput(0);
+    }
+  }
+
+  @Test
+  void shouldInspectSortOutputAndValidatedRowType() {
+    SqlPlan plan = planner.plan("SELECT name FROM users WHERE id > 10 ORDER BY id ASC", schema);
+
+    RelNode logicalPlan = plan.logicalPlan().orElseThrow();
+
+    System.out.println("\n===== SORT OUTPUT METADATA =====");
+    System.out.println("Root row type: " + logicalPlan.getRowType());
+    System.out.println("Root field count: " + logicalPlan.getRowType().getFieldCount());
+
+    System.out.println("\n===== VALIDATED SQL METADATA =====");
+    System.out.println("Validated node: " + plan.validatedStatement().getClass().getName());
+    System.out.println("Validated SQL: " + plan.validatedStatement());
   }
 }
