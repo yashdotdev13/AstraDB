@@ -2,6 +2,9 @@ package io.astradb.queryexecutor.plan;
 
 import io.astradb.queryexecutor.operator.PhysicalOperator;
 import io.astradb.queryexecutor.operator.TableScanOperator;
+import io.astradb.queryexecutor.operator.aggregate.AggregateCall;
+import io.astradb.queryexecutor.operator.aggregate.AggregateFunction;
+import io.astradb.queryexecutor.operator.aggregate.AggregateOperator;
 import io.astradb.queryexecutor.operator.filter.FilterOperator;
 import io.astradb.queryexecutor.operator.limit.LimitOperator;
 import io.astradb.queryexecutor.operator.limit.OffsetOperator;
@@ -22,6 +25,7 @@ import java.util.Objects;
 import java.util.function.Function;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.Aggregate;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
 import org.apache.calcite.rel.core.Sort;
@@ -119,6 +123,10 @@ public final class PhysicalPlanTranslator {
       return translateTableScan(tableScan);
     }
 
+    if (logicalPlan instanceof Aggregate aggregate) {
+      return translateAggregate(aggregate);
+    }
+
     if (logicalPlan instanceof Filter filter) {
       return translateFilter(filter);
     }
@@ -153,6 +161,74 @@ public final class PhysicalPlanTranslator {
                         "Table not found in AstraDB schema: " + tableName));
 
     return new TableScanOperator(tableAccess, transaction, table);
+  }
+
+  /**
+   * Translates a Calcite aggregate node into a physical aggregation operator.
+   *
+   * @param aggregate Calcite aggregate node
+   * @return physical aggregation operator
+   */
+  private PhysicalOperator translateAggregate(Aggregate aggregate) {
+    if (aggregate.getGroupSets().size() != 1
+        || !aggregate.getGroupSets().get(0).equals(aggregate.getGroupSet())) {
+      throw new UnsupportedOperationException("Multiple grouping sets are not supported");
+    }
+
+    int[] groupByColumns =
+        aggregate.getGroupSet().asList().stream().mapToInt(Integer::intValue).toArray();
+
+    List<AggregateCall> aggregateCalls = new ArrayList<>();
+
+    for (org.apache.calcite.rel.core.AggregateCall calciteCall : aggregate.getAggCallList()) {
+
+      if (calciteCall.isDistinct()) {
+        throw new UnsupportedOperationException(
+            "DISTINCT aggregate functions are not supported yet");
+      }
+
+      if (calciteCall.hasFilter()) {
+        throw new UnsupportedOperationException("Aggregate FILTER clauses are not supported yet");
+      }
+
+      AggregateFunction function =
+          switch (calciteCall.getAggregation().getKind()) {
+            case COUNT -> AggregateFunction.COUNT;
+            case SUM -> AggregateFunction.SUM;
+            case AVG -> AggregateFunction.AVG;
+            case MIN -> AggregateFunction.MIN;
+            case MAX -> AggregateFunction.MAX;
+            default ->
+                throw new UnsupportedOperationException(
+                    "Unsupported aggregate function: " + calciteCall.getAggregation().getName());
+          };
+
+      List<Integer> arguments = calciteCall.getArgList();
+
+      if (function == AggregateFunction.COUNT && arguments.isEmpty()) {
+        aggregateCalls.add(AggregateCall.countStar());
+        continue;
+      }
+
+      if (arguments.size() != 1) {
+        throw new UnsupportedOperationException(function + " requires exactly one input column");
+      }
+
+      int inputColumnIndex = arguments.get(0);
+
+      aggregateCalls.add(
+          switch (function) {
+            case COUNT -> AggregateCall.count(inputColumnIndex);
+            case SUM -> AggregateCall.sum(inputColumnIndex);
+            case AVG -> AggregateCall.avg(inputColumnIndex);
+            case MIN -> AggregateCall.min(inputColumnIndex);
+            case MAX -> AggregateCall.max(inputColumnIndex);
+          });
+    }
+
+    PhysicalOperator input = translate(aggregate.getInput());
+
+    return new AggregateOperator(input, groupByColumns, aggregateCalls);
   }
 
   private PhysicalOperator translateFilter(Filter filter) {
