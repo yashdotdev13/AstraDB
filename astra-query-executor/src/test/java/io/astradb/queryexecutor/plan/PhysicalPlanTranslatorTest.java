@@ -491,6 +491,87 @@ class PhysicalPlanTranslatorTest {
     assertEquals(3L, results.get(0).getValue(0));
   }
 
+  @Test
+  void shouldExecuteHavingWithSumAggregation() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan =
+        sqlPlanner.plan(
+            "SELECT name, SUM(id) " + "FROM users " + "GROUP BY name " + "HAVING SUM(id) > 10",
+            schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(2, results.size());
+
+    assertTrue(
+        results.stream()
+            .anyMatch(
+                row ->
+                    "Bob".equals(row.getValue(0)) && new BigDecimal("15").equals(row.getValue(1))));
+
+    assertTrue(
+        results.stream()
+            .anyMatch(
+                row ->
+                    "Charlie".equals(row.getValue(0))
+                        && new BigDecimal("25").equals(row.getValue(1))));
+
+    assertFalse(results.stream().anyMatch(row -> "Alice".equals(row.getValue(0))));
+  }
+
+  @Test
+  void shouldExecuteHavingWithCountAggregation() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan =
+        sqlPlanner.plan(
+            "SELECT name, COUNT(*) FROM users " + "GROUP BY name HAVING COUNT(*) >= 1", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(3, results.size());
+    assertTrue(results.stream().allMatch(row -> Long.valueOf(1L).equals(row.getValue(1))));
+  }
+
+  @Test
+  void shouldExecuteHavingWithAvgAggregation() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan =
+        sqlPlanner.plan(
+            "SELECT name, AVG(id) FROM users " + "GROUP BY name HAVING AVG(id) > 10", schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(2, results.size());
+    assertTrue(results.stream().anyMatch(row -> "Bob".equals(row.getValue(0))));
+    assertTrue(results.stream().anyMatch(row -> "Charlie".equals(row.getValue(0))));
+  }
+
+  @Test
+  void shouldExecuteCombinedWhereAndHaving() {
+    insertTestUsers();
+    activeTransaction = transactionManager.begin();
+
+    SqlPlan sqlPlan =
+        sqlPlanner.plan(
+            "SELECT name, SUM(id) FROM users "
+                + "WHERE id >= 5 "
+                + "GROUP BY name "
+                + "HAVING SUM(id) > 10",
+            schema);
+
+    List<RelationalRow> results = execute(sqlPlan);
+
+    assertEquals(2, results.size());
+    assertTrue(results.stream().anyMatch(row -> "Bob".equals(row.getValue(0))));
+    assertTrue(results.stream().anyMatch(row -> "Charlie".equals(row.getValue(0))));
+  }
+
   private record PhysicalOperatorHolder(
       io.astradb.queryexecutor.operator.PhysicalOperator operator) {}
 }
