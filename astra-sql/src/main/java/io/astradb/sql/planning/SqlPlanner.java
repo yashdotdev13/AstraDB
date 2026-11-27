@@ -47,10 +47,10 @@ public class SqlPlanner {
 
       if (statementType == SqlStatementType.SELECT
           || statementType == SqlStatementType.UPDATE
-          || statementType == SqlStatementType.DELETE) {
+          || statementType == SqlStatementType.DELETE
+          || statementType == SqlStatementType.MERGE) {
         logicalPlan = Optional.of(planner.rel(validatedStatement).rel);
       }
-
       return new SqlPlan(sql, statementType, validatedStatement, logicalPlan);
     } catch (org.apache.calcite.sql.parser.SqlParseException exception) {
       throw new SqlParseException(
