@@ -12,6 +12,7 @@ import io.astradb.sql.model.SqlSchema;
 import io.astradb.sql.model.SqlStatementType;
 import io.astradb.sql.model.SqlTable;
 import java.util.List;
+import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
@@ -89,13 +90,15 @@ class SqlPlannerTest {
   }
 
   @Test
-  void shouldCreatePlanForDeleteStatement() {
+  void shouldCreateLogicalTableModifyPlanForDeleteStatement() {
     String sql = "DELETE FROM users WHERE id = 1";
 
     SqlPlan plan = planner.plan(sql, schema);
-
     assertEquals(SqlStatementType.DELETE, plan.statementType());
-    assertTrue(plan.logicalPlan().isEmpty());
+    RelNode logicalPlan = plan.logicalPlan().orElseThrow();
+    assertTrue(logicalPlan instanceof TableModify);
+    TableModify tableModify = (TableModify) logicalPlan;
+    assertEquals(TableModify.Operation.DELETE, tableModify.getOperation());
   }
 
   @Test

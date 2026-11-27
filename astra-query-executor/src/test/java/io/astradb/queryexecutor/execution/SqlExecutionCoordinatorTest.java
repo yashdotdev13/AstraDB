@@ -8,10 +8,7 @@ import io.astradb.queryexecutor.exception.QueryExecutionException;
 import io.astradb.queryexecutor.model.SqlExecutionResult;
 import io.astradb.queryexecutor.storage.RelationalRowSerializer;
 import io.astradb.queryexecutor.storage.TransactionBackedRelationalTableAccess;
-import io.astradb.sql.model.RelationalRow;
-import io.astradb.sql.model.SqlColumn;
-import io.astradb.sql.model.SqlSchema;
-import io.astradb.sql.model.SqlTable;
+import io.astradb.sql.model.*;
 import io.astradb.sql.planning.SqlPlanner;
 import io.astradb.storage.mvcc.SnapshotManager;
 import io.astradb.storage.rocksdb.StringKeySerializer;
@@ -165,7 +162,7 @@ class SqlExecutionCoordinatorTest {
   void shouldRejectUnsupportedSqlStatement() {
     assertThrows(
         QueryExecutionException.class,
-        () -> coordinator.execute("DELETE FROM users WHERE id = 1", schema, activeTransaction));
+        () -> coordinator.execute("VALUES (1)", schema, activeTransaction));
   }
 
   @Test
@@ -196,5 +193,100 @@ class SqlExecutionCoordinatorTest {
             "UPDATE users SET name = 'Updated' WHERE id = 999", schema, activeTransaction);
 
     assertEquals(0, result.affectedRows());
+  }
+
+  @Test
+  void shouldDeleteMatchingRow() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')", schema, activeTransaction);
+
+    SqlExecutionResult result =
+        coordinator.execute("DELETE FROM users WHERE id = 1", schema, activeTransaction);
+
+    assertEquals(SqlStatementType.DELETE, result.statementType());
+    assertEquals(1, result.affectedRows());
+
+    SqlExecutionResult selectResult =
+        coordinator.execute("SELECT * FROM users", schema, activeTransaction);
+
+    assertEquals(1, selectResult.rows().size());
+  }
+
+  @Test
+  void shouldDeleteMultipleMatchingRows() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES " + "(1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+        schema,
+        activeTransaction);
+
+    SqlExecutionResult result =
+        coordinator.execute("DELETE FROM users WHERE id > 1", schema, activeTransaction);
+
+    assertEquals(2, result.affectedRows());
+
+    SqlExecutionResult selectResult =
+        coordinator.execute("SELECT * FROM users", schema, activeTransaction);
+
+    assertEquals(1, selectResult.rows().size());
+  }
+
+  @Test
+  void shouldDeleteAllRowsWhenWhereClauseIsMissing() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')", schema, activeTransaction);
+
+    SqlExecutionResult result = coordinator.execute("DELETE FROM users", schema, activeTransaction);
+
+    assertEquals(2, result.affectedRows());
+
+    SqlExecutionResult selectResult =
+        coordinator.execute("SELECT * FROM users", schema, activeTransaction);
+
+    assertEquals(0, selectResult.rows().size());
+  }
+
+  @Test
+  void shouldReturnZeroWhenNoRowsMatchDeleteCondition() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')", schema, activeTransaction);
+
+    SqlExecutionResult result =
+        coordinator.execute("DELETE FROM users WHERE id = 999", schema, activeTransaction);
+
+    assertEquals(0, result.affectedRows());
+
+    SqlExecutionResult selectResult =
+        coordinator.execute("SELECT * FROM users", schema, activeTransaction);
+
+    assertEquals(2, selectResult.rows().size());
+  }
+
+  @Test
+  void shouldRollbackDeleteAndRestoreOriginalRows() {
+    // Step 1: Insert seed data.
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')", schema, activeTransaction);
+
+    // Step 2: Commit seed data.
+    transactionManager.commit(activeTransaction.getId());
+
+    // Step 3: Start a new transaction for DELETE.
+    activeTransaction = transactionManager.begin();
+
+    SqlExecutionResult deleteResult =
+        coordinator.execute("DELETE FROM users WHERE id = 1", schema, activeTransaction);
+
+    assertEquals(1, deleteResult.affectedRows());
+
+    // Step 4: Roll back DELETE.
+    transactionManager.rollback(activeTransaction.getId());
+
+    // Step 5: Start another transaction and verify.
+    activeTransaction = transactionManager.begin();
+
+    SqlExecutionResult selectResult =
+        coordinator.execute("SELECT * FROM users", schema, activeTransaction);
+
+    assertEquals(2, selectResult.rows().size());
   }
 }

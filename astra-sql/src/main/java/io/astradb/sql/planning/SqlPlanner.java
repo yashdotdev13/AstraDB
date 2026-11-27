@@ -45,7 +45,9 @@ public class SqlPlanner {
 
       Optional<RelNode> logicalPlan = Optional.empty();
 
-      if (statementType == SqlStatementType.SELECT || statementType == SqlStatementType.UPDATE) {
+      if (statementType == SqlStatementType.SELECT
+          || statementType == SqlStatementType.UPDATE
+          || statementType == SqlStatementType.DELETE) {
         logicalPlan = Optional.of(planner.rel(validatedStatement).rel);
       }
 

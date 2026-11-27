@@ -56,6 +56,7 @@ public final class SqlExecutionCoordinator {
       case SELECT -> executeSelect(plan, schema, transaction);
       case INSERT -> executeInsert(plan, schema, transaction);
       case UPDATE -> executeUpdate(plan, schema, transaction);
+      case DELETE -> executeDelete(plan, schema, transaction);
       default ->
           throw new QueryExecutionException(
               "Unsupported SQL statement type: " + plan.statementType());
@@ -85,5 +86,13 @@ public final class SqlExecutionCoordinator {
     DmlExecutionResult result = dmlExecutor.execute(plan, schema, transaction);
 
     return SqlExecutionResult.modification(SqlStatementType.UPDATE, result.affectedRows());
+  }
+
+  private SqlExecutionResult executeDelete(
+      SqlPlan plan, SqlSchema schema, Transaction<String, RelationalRow> transaction) {
+
+    DmlExecutionResult result = dmlExecutor.execute(plan, schema, transaction);
+
+    return SqlExecutionResult.modification(SqlStatementType.DELETE, result.affectedRows());
   }
 }
