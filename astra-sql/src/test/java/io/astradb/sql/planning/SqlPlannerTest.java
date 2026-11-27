@@ -12,7 +12,6 @@ import io.astradb.sql.model.SqlSchema;
 import io.astradb.sql.model.SqlStatementType;
 import io.astradb.sql.model.SqlTable;
 import java.util.List;
-import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
