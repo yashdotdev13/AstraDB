@@ -14,7 +14,9 @@ import io.astradb.sql.model.SqlTable;
 import java.util.List;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
+import org.apache.calcite.rel.core.Join;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.core.Sort;
 import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.core.TableScan;
 import org.junit.jupiter.api.BeforeEach;
@@ -34,6 +36,11 @@ class SqlPlannerTest {
             List.of(
                 new SqlTable(
                     "users",
+                    List.of(
+                        new SqlColumn("id", "INTEGER", false),
+                        new SqlColumn("name", "VARCHAR", true))),
+                new SqlTable(
+                    "incoming_users",
                     List.of(
                         new SqlColumn("id", "INTEGER", false),
                         new SqlColumn("name", "VARCHAR", true)))));
@@ -66,26 +73,22 @@ class SqlPlannerTest {
   }
 
   @Test
-  void shouldInspectUpdateLogicalPlan() {
+  void shouldCreateLogicalTableModifyPlanForUpdateStatement() {
     SqlPlan plan = planner.plan("UPDATE users SET name = 'Updated' WHERE id = 1", schema);
+
+    assertEquals(SqlStatementType.UPDATE, plan.statementType());
 
     RelNode logicalPlan = plan.logicalPlan().orElseThrow();
 
-    System.out.println("\n===== UPDATE LOGICAL PLAN =====");
-    System.out.println(org.apache.calcite.plan.RelOptUtil.toString(logicalPlan));
-
-    System.out.println("\n===== UPDATE NODE =====");
-    System.out.println(logicalPlan.getClass().getName());
+    assertTrue(logicalPlan instanceof TableModify);
 
     TableModify modify = (TableModify) logicalPlan;
 
-    System.out.println("Operation: " + modify.getOperation());
-    System.out.println("Update columns: " + modify.getUpdateColumnList());
-    System.out.println("Source expressions: " + modify.getSourceExpressionList());
-
-    System.out.println("\n===== INPUT NODE =====");
-    System.out.println(modify.getInput().getClass().getName());
-    System.out.println(org.apache.calcite.plan.RelOptUtil.toString(modify.getInput()));
+    assertEquals(TableModify.Operation.UPDATE, modify.getOperation());
+    assertEquals(List.of("NAME"), modify.getUpdateColumnList());
+    assertNotNull(modify.getSourceExpressionList());
+    assertTrue(modify.getInput() instanceof Project);
+    assertTrue(modify.getInput().getInput(0) instanceof Filter);
   }
 
   @Test
@@ -93,11 +96,57 @@ class SqlPlannerTest {
     String sql = "DELETE FROM users WHERE id = 1";
 
     SqlPlan plan = planner.plan(sql, schema);
+
     assertEquals(SqlStatementType.DELETE, plan.statementType());
+
     RelNode logicalPlan = plan.logicalPlan().orElseThrow();
+
     assertTrue(logicalPlan instanceof TableModify);
+
     TableModify tableModify = (TableModify) logicalPlan;
+
     assertEquals(TableModify.Operation.DELETE, tableModify.getOperation());
+  }
+
+  @Test
+  void shouldCreateLogicalMergePlanForMergeStatement() {
+    String sql =
+        """
+            MERGE INTO users AS target
+            USING incoming_users AS source
+            ON target.id = source.id
+            WHEN MATCHED THEN
+                UPDATE SET name = source.name
+            WHEN NOT MATCHED THEN
+                INSERT (id, name)
+                VALUES (source.id, source.name)
+            """;
+
+    SqlPlan plan = planner.plan(sql, schema);
+
+    assertEquals(SqlStatementType.MERGE, plan.statementType());
+    assertNotNull(plan.validatedStatement());
+
+    RelNode logicalPlan = plan.logicalPlan().orElseThrow();
+
+    assertTrue(logicalPlan instanceof TableModify);
+
+    TableModify modify = (TableModify) logicalPlan;
+
+    assertEquals(TableModify.Operation.MERGE, modify.getOperation());
+    assertEquals(List.of("NAME"), modify.getUpdateColumnList());
+
+    assertTrue(modify.getInput() instanceof Project);
+
+    Project project = (Project) modify.getInput();
+
+    assertTrue(project.getInput() instanceof Join);
+
+    Join join = (Join) project.getInput();
+
+    assertEquals(org.apache.calcite.rel.core.JoinRelType.LEFT, join.getJoinType());
+    assertTrue(join.getLeft() instanceof TableScan);
+    assertTrue(join.getRight() instanceof TableScan);
   }
 
   @Test
@@ -164,98 +213,49 @@ class SqlPlannerTest {
   }
 
   @Test
-  void shouldPrintLogicalPlanStructureForPhysicalTranslation() {
+  void shouldGenerateLogicalPlanWithTableScanForFilteredProjection() {
     SqlPlan plan = planner.plan("SELECT name FROM users WHERE id > 10", schema);
 
     RelNode logicalPlan = plan.logicalPlan().orElseThrow();
 
-    System.out.println("\n===== ASTRA DB LOGICAL PLAN =====");
-    System.out.println(new SqlPlanExplainer().explain(plan));
-
-    System.out.println("\n===== TABLE SCAN DETAILS =====");
-
-    RelNode scanNode = logicalPlan;
-
-    while (!(scanNode instanceof TableScan)) {
-      if (scanNode.getInputs().isEmpty()) {
-        throw new IllegalStateException("No TableScan found in logical plan");
-      }
-
-      scanNode = scanNode.getInput(0);
-    }
-
-    TableScan tableScan = (TableScan) scanNode;
-
-    System.out.println("Scan class: " + tableScan.getClass().getName());
-    System.out.println("Qualified name: " + tableScan.getTable().getQualifiedName());
-    System.out.println("Scan row type: " + tableScan.getRowType());
-    System.out.println("Table object: " + tableScan.getTable().getClass().getName());
-
-    System.out.println("\n===== RELATIONAL NODE DETAILS =====");
+    assertTrue(logicalPlan instanceof Project);
 
     RelNode current = logicalPlan;
 
-    while (true) {
-      System.out.println("\nNode: " + current.getClass().getName());
-      System.out.println("Inputs: " + current.getInputs().size());
-      System.out.println("Row type: " + current.getRowType());
-
-      if (current instanceof TableScan tableScanNode) {
-        System.out.println("Qualified table name: " + tableScanNode.getTable().getQualifiedName());
-      }
-
-      if (current.getInputs().isEmpty()) {
-        break;
-      }
-
+    while (!(current instanceof TableScan)) {
+      assertTrue(!current.getInputs().isEmpty());
       current = current.getInput(0);
     }
+
+    TableScan tableScan = (TableScan) current;
+
+    assertEquals(List.of("ASTRA", "USERS"), tableScan.getTable().getQualifiedName());
+    assertEquals(2, tableScan.getRowType().getFieldCount());
   }
 
   @Test
-  void shouldPrintSortPlanStructureForPhysicalTranslation() {
+  void shouldGenerateSortPlanForOrderByClause() {
     SqlPlan plan = planner.plan("SELECT name FROM users WHERE id > 10 ORDER BY id ASC", schema);
 
     RelNode logicalPlan = plan.logicalPlan().orElseThrow();
 
-    System.out.println("\n===== ORDER BY LOGICAL PLAN =====");
-    System.out.println(new SqlPlanExplainer().explain(plan));
+    assertTrue(logicalPlan instanceof Sort);
 
-    System.out.println("\n===== SORT NODE DETAILS =====");
+    Sort sort = (Sort) logicalPlan;
 
-    RelNode current = logicalPlan;
-
-    while (true) {
-      System.out.println("\nNode: " + current.getClass().getName());
-      System.out.println("Row type: " + current.getRowType());
-
-      if (current instanceof org.apache.calcite.rel.core.Sort sort) {
-        System.out.println("Collation: " + sort.getCollation());
-        System.out.println("Field collations: " + sort.getCollation().getFieldCollations());
-        System.out.println("Offset: " + sort.offset);
-        System.out.println("Fetch: " + sort.fetch);
-      }
-
-      if (current.getInputs().isEmpty()) {
-        break;
-      }
-
-      current = current.getInput(0);
-    }
+    assertNotNull(sort.getCollation());
+    assertEquals(1, sort.getCollation().getFieldCollations().size());
+    assertTrue(sort.getInput() instanceof Project);
   }
 
   @Test
-  void shouldInspectSortOutputAndValidatedRowType() {
+  void shouldPreserveSortOutputMetadata() {
     SqlPlan plan = planner.plan("SELECT name FROM users WHERE id > 10 ORDER BY id ASC", schema);
 
     RelNode logicalPlan = plan.logicalPlan().orElseThrow();
 
-    System.out.println("\n===== SORT OUTPUT METADATA =====");
-    System.out.println("Root row type: " + logicalPlan.getRowType());
-    System.out.println("Root field count: " + logicalPlan.getRowType().getFieldCount());
-
-    System.out.println("\n===== VALIDATED SQL METADATA =====");
-    System.out.println("Validated node: " + plan.validatedStatement().getClass().getName());
-    System.out.println("Validated SQL: " + plan.validatedStatement());
+    assertEquals(2, logicalPlan.getRowType().getFieldCount());
+    assertNotNull(plan.validatedStatement());
+    assertEquals(SqlStatementType.SELECT, plan.statementType());
   }
 }
