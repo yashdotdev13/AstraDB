@@ -42,6 +42,22 @@ public class TransactionBackedRelationalTableAccess {
     return key;
   }
 
+  public void delete(Transaction<String, RelationalRow> transaction, SqlTable table, String key) {
+
+    Objects.requireNonNull(transaction, "Transaction must not be null");
+    Objects.requireNonNull(table, "Table must not be null");
+    Objects.requireNonNull(key, "Storage key must not be null");
+
+    String expectedPrefix = tablePrefix(table) + "ROW:";
+
+    if (!key.startsWith(expectedPrefix)) {
+      throw new IllegalArgumentException(
+          "Storage key does not belong to table '" + table.name() + "'");
+    }
+
+    transaction.delete(key);
+  }
+
   /**
    * Scans all rows visible to the transaction for the specified table.
    *
