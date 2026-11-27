@@ -13,10 +13,12 @@ import java.util.Objects;
 public final class DmlExecutor {
 
   private final InsertExecutor insertExecutor;
+  private final UpdateExecutor updateExecutor;
 
   public DmlExecutor(TransactionBackedRelationalTableAccess tableAccess) {
     Objects.requireNonNull(tableAccess, "Table access must not be null");
     this.insertExecutor = new InsertExecutor(tableAccess);
+    this.updateExecutor = new UpdateExecutor(tableAccess);
   }
 
   public DmlExecutionResult execute(
@@ -28,6 +30,10 @@ public final class DmlExecutor {
 
     if (plan.statementType() == SqlStatementType.INSERT) {
       return insertExecutor.execute(plan, schema, transaction);
+    }
+
+    if (plan.statementType() == SqlStatementType.UPDATE) {
+      return updateExecutor.execute(plan, schema, transaction);
     }
 
     throw new QueryExecutionException("Unsupported DML statement type: " + plan.statementType());

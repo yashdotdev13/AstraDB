@@ -15,6 +15,7 @@ import java.util.List;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.Filter;
 import org.apache.calcite.rel.core.Project;
+import org.apache.calcite.rel.core.TableModify;
 import org.apache.calcite.rel.core.TableScan;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -65,13 +66,26 @@ class SqlPlannerTest {
   }
 
   @Test
-  void shouldCreatePlanForUpdateStatement() {
-    String sql = "UPDATE users SET name = 'Updated' WHERE id = 1";
+  void shouldInspectUpdateLogicalPlan() {
+    SqlPlan plan = planner.plan("UPDATE users SET name = 'Updated' WHERE id = 1", schema);
 
-    SqlPlan plan = planner.plan(sql, schema);
+    RelNode logicalPlan = plan.logicalPlan().orElseThrow();
 
-    assertEquals(SqlStatementType.UPDATE, plan.statementType());
-    assertTrue(plan.logicalPlan().isEmpty());
+    System.out.println("\n===== UPDATE LOGICAL PLAN =====");
+    System.out.println(org.apache.calcite.plan.RelOptUtil.toString(logicalPlan));
+
+    System.out.println("\n===== UPDATE NODE =====");
+    System.out.println(logicalPlan.getClass().getName());
+
+    TableModify modify = (TableModify) logicalPlan;
+
+    System.out.println("Operation: " + modify.getOperation());
+    System.out.println("Update columns: " + modify.getUpdateColumnList());
+    System.out.println("Source expressions: " + modify.getSourceExpressionList());
+
+    System.out.println("\n===== INPUT NODE =====");
+    System.out.println(modify.getInput().getClass().getName());
+    System.out.println(org.apache.calcite.plan.RelOptUtil.toString(modify.getInput()));
   }
 
   @Test

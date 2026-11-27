@@ -165,8 +165,36 @@ class SqlExecutionCoordinatorTest {
   void shouldRejectUnsupportedSqlStatement() {
     assertThrows(
         QueryExecutionException.class,
-        () ->
-            coordinator.execute(
-                "UPDATE users SET name = 'Updated' WHERE id = 1", schema, activeTransaction));
+        () -> coordinator.execute("DELETE FROM users WHERE id = 1", schema, activeTransaction));
+  }
+
+  @Test
+  void shouldUpdateAndSelectWithinSameTransaction() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Yash'), (2, 'Alex')", schema, activeTransaction);
+
+    SqlExecutionResult updateResult =
+        coordinator.execute(
+            "UPDATE users SET name = 'Updated' WHERE id = 1", schema, activeTransaction);
+
+    SqlExecutionResult selectResult =
+        coordinator.execute("SELECT id, name FROM users WHERE id = 1", schema, activeTransaction);
+
+    assertEquals(1, updateResult.affectedRows());
+    assertEquals(1, selectResult.rows().size());
+    assertEquals(1, selectResult.rows().get(0).getValue(0));
+    assertEquals("Updated", selectResult.rows().get(0).getValue(1));
+  }
+
+  @Test
+  void shouldReturnZeroWhenUpdateMatchesNoRows() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Yash')", schema, activeTransaction);
+
+    SqlExecutionResult result =
+        coordinator.execute(
+            "UPDATE users SET name = 'Updated' WHERE id = 999", schema, activeTransaction);
+
+    assertEquals(0, result.affectedRows());
   }
 }
