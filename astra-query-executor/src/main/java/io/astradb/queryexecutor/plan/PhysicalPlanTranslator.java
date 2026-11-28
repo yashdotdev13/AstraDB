@@ -6,6 +6,7 @@ import io.astradb.queryexecutor.operator.aggregate.AggregateCall;
 import io.astradb.queryexecutor.operator.aggregate.AggregateFunction;
 import io.astradb.queryexecutor.operator.aggregate.AggregateOperator;
 import io.astradb.queryexecutor.operator.filter.FilterOperator;
+import io.astradb.queryexecutor.operator.join.HashJoinOperator;
 import io.astradb.queryexecutor.operator.join.NestedLoopJoinOperator;
 import io.astradb.queryexecutor.operator.limit.LimitOperator;
 import io.astradb.queryexecutor.operator.limit.OffsetOperator;
@@ -27,8 +28,11 @@ import java.util.function.Function;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
 import org.apache.calcite.rel.core.*;
+import org.apache.calcite.rex.RexCall;
+import org.apache.calcite.rex.RexInputRef;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
+import org.apache.calcite.sql.SqlKind;
 import org.apache.calcite.sql.SqlNode;
 import org.apache.calcite.sql.SqlSelect;
 
@@ -341,6 +345,15 @@ public final class PhysicalPlanTranslator {
     }
   }
 
+  /**
+   * Translates a Calcite join node into a physical join operator.
+   *
+   * <p>INNER equi-joins use Hash Join. LEFT JOIN and unsupported INNER JOIN conditions use Nested
+   * Loop Join.
+   *
+   * @param join Calcite join node
+   * @return physical join operator
+   */
   private PhysicalOperator translateJoin(Join join) {
     JoinRelType joinType = join.getJoinType();
 
@@ -354,6 +367,24 @@ public final class PhysicalPlanTranslator {
     try {
       PhysicalOperator rightInput = translate(join.getRight());
 
+      if (joinType == JoinRelType.INNER) {
+        JoinKeyIndexes joinKeys = extractEquiJoinKeys(join);
+
+        if (joinKeys != null) {
+          List<Function<RelationalRow, Object>> leftExtractors =
+              joinKeys.leftIndexes().stream()
+                  .<Function<RelationalRow, Object>>map(index -> row -> row.getValue(index))
+                  .toList();
+
+          List<Function<RelationalRow, Object>> rightExtractors =
+              joinKeys.rightIndexes().stream()
+                  .<Function<RelationalRow, Object>>map(index -> row -> row.getValue(index))
+                  .toList();
+
+          return new HashJoinOperator(leftInput, rightInput, leftExtractors, rightExtractors);
+        }
+      }
+
       boolean leftOuter = joinType == JoinRelType.LEFT;
       int rightColumnCount = join.getRight().getRowType().getFieldCount();
 
@@ -363,9 +394,108 @@ public final class PhysicalPlanTranslator {
           row -> Boolean.TRUE.equals(expressionEvaluator.evaluate(join.getCondition(), row)),
           leftOuter,
           rightColumnCount);
+
     } catch (RuntimeException exception) {
       leftInput.close();
       throw exception;
     }
   }
+
+  /**
+   * Extracts composite equi-join keys from a Calcite join condition.
+   *
+   * <p>Supports equality predicates between direct left-side and right-side input references,
+   * combined using AND.
+   *
+   * <p>If any predicate is unsupported, the method returns null so the caller can use Nested Loop
+   * Join instead.
+   *
+   * @param join Calcite join node
+   * @return extracted key indexes, or null if the condition is unsupported
+   */
+  private JoinKeyIndexes extractEquiJoinKeys(Join join) {
+    List<Integer> leftIndexes = new ArrayList<>();
+    List<Integer> rightIndexes = new ArrayList<>();
+
+    boolean supported =
+        collectEquiJoinKeys(
+            join.getCondition(),
+            join.getLeft().getRowType().getFieldCount(),
+            leftIndexes,
+            rightIndexes);
+
+    if (!supported || leftIndexes.isEmpty()) {
+      return null;
+    }
+
+    return new JoinKeyIndexes(List.copyOf(leftIndexes), List.copyOf(rightIndexes));
+  }
+
+  /**
+   * Recursively extracts equality predicates from an AND expression.
+   *
+   * @param condition Calcite join condition
+   * @param leftColumnCount number of columns in the left input
+   * @param leftIndexes extracted left-side column indexes
+   * @param rightIndexes extracted right-side column indexes
+   * @return true when the complete condition contains only supported equi-join predicates
+   */
+  private boolean collectEquiJoinKeys(
+      RexNode condition,
+      int leftColumnCount,
+      List<Integer> leftIndexes,
+      List<Integer> rightIndexes) {
+
+    if (!(condition instanceof RexCall call)) {
+      return false;
+    }
+
+    if (call.getKind() == SqlKind.AND) {
+      if (call.getOperands().isEmpty()) {
+        return false;
+      }
+
+      for (RexNode operand : call.getOperands()) {
+        if (!collectEquiJoinKeys(operand, leftColumnCount, leftIndexes, rightIndexes)) {
+          return false;
+        }
+      }
+
+      return true;
+    }
+
+    if (call.getKind() != SqlKind.EQUALS || call.getOperands().size() != 2) {
+      return false;
+    }
+
+    RexNode firstOperand = call.getOperands().get(0);
+    RexNode secondOperand = call.getOperands().get(1);
+
+    if (!(firstOperand instanceof RexInputRef firstRef)
+        || !(secondOperand instanceof RexInputRef secondRef)) {
+      return false;
+    }
+
+    int firstIndex = firstRef.getIndex();
+    int secondIndex = secondRef.getIndex();
+
+    // left.column = right.column
+    if (firstIndex < leftColumnCount && secondIndex >= leftColumnCount) {
+      leftIndexes.add(firstIndex);
+      rightIndexes.add(secondIndex - leftColumnCount);
+      return true;
+    }
+
+    // right.column = left.column
+    if (secondIndex < leftColumnCount && firstIndex >= leftColumnCount) {
+      leftIndexes.add(secondIndex);
+      rightIndexes.add(firstIndex - leftColumnCount);
+      return true;
+    }
+
+    return false;
+  }
+
+  /** Stores corresponding left and right join-key indexes. */
+  private record JoinKeyIndexes(List<Integer> leftIndexes, List<Integer> rightIndexes) {}
 }
