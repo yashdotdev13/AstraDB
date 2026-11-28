@@ -6,6 +6,7 @@ import io.astradb.queryexecutor.operator.aggregate.AggregateCall;
 import io.astradb.queryexecutor.operator.aggregate.AggregateFunction;
 import io.astradb.queryexecutor.operator.aggregate.AggregateOperator;
 import io.astradb.queryexecutor.operator.filter.FilterOperator;
+import io.astradb.queryexecutor.operator.join.NestedLoopJoinOperator;
 import io.astradb.queryexecutor.operator.limit.LimitOperator;
 import io.astradb.queryexecutor.operator.limit.OffsetOperator;
 import io.astradb.queryexecutor.operator.project.ExpressionProjectOperator;
@@ -25,11 +26,7 @@ import java.util.Objects;
 import java.util.function.Function;
 import org.apache.calcite.rel.RelFieldCollation;
 import org.apache.calcite.rel.RelNode;
-import org.apache.calcite.rel.core.Aggregate;
-import org.apache.calcite.rel.core.Filter;
-import org.apache.calcite.rel.core.Project;
-import org.apache.calcite.rel.core.Sort;
-import org.apache.calcite.rel.core.TableScan;
+import org.apache.calcite.rel.core.*;
 import org.apache.calcite.rex.RexLiteral;
 import org.apache.calcite.rex.RexNode;
 import org.apache.calcite.sql.SqlNode;
@@ -121,6 +118,10 @@ public final class PhysicalPlanTranslator {
 
     if (logicalPlan instanceof TableScan tableScan) {
       return translateTableScan(tableScan);
+    }
+
+    if (logicalPlan instanceof Join join) {
+      return translateJoin(join);
     }
 
     if (logicalPlan instanceof Aggregate aggregate) {
@@ -337,6 +338,34 @@ public final class PhysicalPlanTranslator {
     } catch (NumberFormatException | ArithmeticException exception) {
       throw new IllegalArgumentException(
           clause + " must be a valid non-negative integer", exception);
+    }
+  }
+
+  private PhysicalOperator translateJoin(Join join) {
+    JoinRelType joinType = join.getJoinType();
+
+    if (joinType != JoinRelType.INNER && joinType != JoinRelType.LEFT) {
+      throw new UnsupportedOperationException(
+          "Only INNER JOIN and LEFT JOIN are supported currently: " + joinType);
+    }
+
+    PhysicalOperator leftInput = translate(join.getLeft());
+
+    try {
+      PhysicalOperator rightInput = translate(join.getRight());
+
+      boolean leftOuter = joinType == JoinRelType.LEFT;
+      int rightColumnCount = join.getRight().getRowType().getFieldCount();
+
+      return new NestedLoopJoinOperator(
+          leftInput,
+          rightInput,
+          row -> Boolean.TRUE.equals(expressionEvaluator.evaluate(join.getCondition(), row)),
+          leftOuter,
+          rightColumnCount);
+    } catch (RuntimeException exception) {
+      leftInput.close();
+      throw exception;
     }
   }
 }
