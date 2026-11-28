@@ -151,8 +151,22 @@ public final class InsertExecutor {
   }
 
   private Object convertLiteral(SqlNode node, SqlColumn column) {
+
+    // Calcite represents CAST(value AS TYPE) using two operands:
+    // operand 0 = value, operand 1 = target type.
+    if (node instanceof SqlCall call && call.getKind() == SqlKind.CAST) {
+
+      if (call.operandCount() < 1) {
+        throw new QueryExecutionException("Invalid CAST expression in INSERT statement");
+      }
+
+      // Convert the underlying value using the target table column type.
+      return convertLiteral(call.operand(0), column);
+    }
+
     if (!(node instanceof SqlLiteral literal)) {
-      throw new QueryExecutionException("Only literal values are supported in INSERT statements");
+      throw new QueryExecutionException(
+          "Only literal values and CAST expressions are supported in INSERT statements");
     }
 
     if (literal.getTypeName() == SqlTypeName.NULL) {

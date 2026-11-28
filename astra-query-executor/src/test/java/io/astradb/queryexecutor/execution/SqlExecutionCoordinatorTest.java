@@ -46,7 +46,15 @@ class SqlExecutionCoordinatorTest {
           "users",
           List.of(new SqlColumn("id", "INTEGER", false), new SqlColumn("name", "VARCHAR", false)));
 
-  private final SqlSchema schema = new SqlSchema(List.of(usersTable));
+  private final SqlTable ordersTable =
+      new SqlTable(
+          "orders",
+          List.of(
+              new SqlColumn("order_id", "INTEGER", false),
+              new SqlColumn("user_id", "INTEGER", false),
+              new SqlColumn("amount", "DECIMAL", false)));
+
+  private final SqlSchema schema = new SqlSchema(List.of(usersTable, ordersTable));
 
   @BeforeEach
   void setUp() throws Exception {
@@ -288,5 +296,134 @@ class SqlExecutionCoordinatorTest {
         coordinator.execute("SELECT * FROM users", schema, activeTransaction);
 
     assertEquals(2, selectResult.rows().size());
+  }
+
+  @Test
+  void shouldExecuteInnerJoinAndReturnMatchingRows() {
+    // Insert users.
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES " + "(1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+        schema,
+        activeTransaction);
+
+    // Insert orders. Alice has two orders; Bob has one.
+    coordinator.execute(
+        "INSERT INTO orders (order_id, user_id, amount) VALUES "
+            + "(101, 1, 500), (102, 1, 700), (103, 2, 300)",
+        schema,
+        activeTransaction);
+
+    // Execute INNER JOIN.
+    SqlExecutionResult result =
+        coordinator.execute(
+            """
+                    SELECT u.id, u.name, o.order_id, o.amount
+                    FROM users u
+                    INNER JOIN orders o ON u.id = o.user_id
+                    """,
+            schema,
+            activeTransaction);
+
+    assertEquals(SqlStatementType.SELECT, result.statementType());
+    assertEquals(3, result.rows().size());
+
+    Set<String> actualRows =
+        result.rows().stream()
+            .map(
+                row ->
+                    row.getValue(0)
+                        + "|"
+                        + row.getValue(1)
+                        + "|"
+                        + row.getValue(2)
+                        + "|"
+                        + row.getValue(3))
+            .collect(Collectors.toSet());
+
+    assertEquals(Set.of("1|Alice|101|500", "1|Alice|102|700", "2|Bob|103|300"), actualRows);
+  }
+
+  @Test
+  void shouldReturnEmptyResultWhenInnerJoinHasNoMatches() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Alice')", schema, activeTransaction);
+
+    coordinator.execute(
+        "INSERT INTO orders (order_id, user_id, amount) VALUES (101, 999, 500)",
+        schema,
+        activeTransaction);
+
+    SqlExecutionResult result =
+        coordinator.execute(
+            """
+                    SELECT u.id, u.name, o.order_id
+                    FROM users u
+                    INNER JOIN orders o ON u.id = o.user_id
+                    """,
+            schema,
+            activeTransaction);
+
+    assertEquals(0, result.rows().size());
+  }
+
+  @Test
+  void shouldExecuteLeftJoinAndPreserveUnmatchedRows() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES " + "(1, 'Alice'), (2, 'Bob'), (3, 'Charlie')",
+        schema,
+        activeTransaction);
+
+    coordinator.execute(
+        "INSERT INTO orders (order_id, user_id, amount) VALUES "
+            + "(101, 1, 500), (102, 1, 700), (103, 2, 300)",
+        schema,
+        activeTransaction);
+
+    SqlExecutionResult result =
+        coordinator.execute(
+            """
+                    SELECT u.id, u.name, o.order_id, o.amount
+                    FROM users u
+                    LEFT JOIN orders o ON u.id = o.user_id
+                    """,
+            schema,
+            activeTransaction);
+
+    assertEquals(SqlStatementType.SELECT, result.statementType());
+    assertEquals(4, result.rows().size());
+
+    var charlieRow =
+        result.rows().stream().filter(row -> row.getValue(0).equals(3)).findFirst().orElseThrow();
+
+    assertEquals("Charlie", charlieRow.getValue(1));
+    assertEquals(null, charlieRow.getValue(2));
+    assertEquals(null, charlieRow.getValue(3));
+
+    long aliceOrders = result.rows().stream().filter(row -> row.getValue(0).equals(1)).count();
+
+    assertEquals(2, aliceOrders);
+  }
+
+  @Test
+  void shouldExecuteLeftJoinWhenRightTableIsEmpty() {
+    coordinator.execute(
+        "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')", schema, activeTransaction);
+
+    SqlExecutionResult result =
+        coordinator.execute(
+            """
+                    SELECT u.id, u.name, o.order_id, o.amount
+                    FROM users u
+                    LEFT JOIN orders o ON u.id = o.user_id
+                    """,
+            schema,
+            activeTransaction);
+
+    assertEquals(2, result.rows().size());
+
+    for (var row : result.rows()) {
+      assertEquals(null, row.getValue(2));
+      assertEquals(null, row.getValue(3));
+    }
   }
 }
